@@ -53,7 +53,7 @@ async def setup_bot(ctx: Ctx):
         if s.telegram_api_url else AiohttpSession()
     session.timeout = 600  # big uploads
     bot = Bot(s.bot_token, session=session, default=DefaultBotProperties(
-        parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True)))
+        parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
     me = await bot.get_me()
     ctx.bot, ctx.bot_username = bot, me.username
     ctx.tg = TelegramIO(ctx)
