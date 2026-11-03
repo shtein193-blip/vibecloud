@@ -1,0 +1,106 @@
+from __future__ import annotations
+
+import hashlib
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def _load_dotenv(path: str = ".env") -> None:
+    """Minimal .env loader (no extra dependency)."""
+    p = Path(path)
+    if not p.exists():
+        return
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.split(" #", 1)[0].strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def _int(name: str, default: int | None = None) -> int | None:
+    value = os.getenv(name, "").strip()
+    return int(value) if value else default
+
+
+def _bool(name: str, default: bool) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return default if not value else value in ("1", "true", "yes", "on")
+
+
+@dataclass(frozen=True)
+class Settings:
+    bot_token: str
+    public_url: str
+    webapp_short_name: str | None
+    storage_chat_id: int | None
+    host: str
+    port: int
+    data_dir: Path
+    cache_max_bytes: int
+    download_workers: int
+    prefetch_per_import: int
+    max_import_tracks: int
+    sync_interval_min: int
+    sc_client_id: str | None
+    telegram_api_url: str | None
+    dev_user_id: int | None
+    lite_mode: bool
+    mp3_max_kbps: int
+    db_backup_min: int
+    secret: bytes = field(repr=False)
+
+    @property
+    def max_upload_bytes(self) -> int:
+        # Bot API: 50 MB. Local Bot API server: up to 2000 MB.
+        return (1900 if self.telegram_api_url else 49) * 1024 * 1024
+
+    @property
+    def bot_enabled(self) -> bool:
+        return bool(self.bot_token)
+
+    @property
+    def cache_dir(self) -> Path:
+        return self.data_dir / "audio"
+
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / "vibecloud.db"
+
+
+def load_settings() -> Settings:
+    _load_dotenv()
+    token = os.getenv("BOT_TOKEN", "").strip()
+    data_dir = Path(os.getenv("DATA_DIR", "./data")).resolve()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "audio").mkdir(exist_ok=True)
+    secret_seed = token or os.getenv("APP_SECRET", "vibecloud-dev-secret")
+    # LITE_MODE: Telegram-first. Player streams straight from SoundCloud's CDN, files live in Telegram
+    # (file_id), the server keeps only a tiny temporary cache and downloads nothing in advance.
+    lite = _bool("LITE_MODE", True)
+    return Settings(
+        bot_token=token,
+        # RENDER_EXTERNAL_URL is set automatically on Render (https://<service>.onrender.com)
+        public_url=(os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+                    or f"http://localhost:{os.getenv('PORT') or 8080}").rstrip("/"),
+        webapp_short_name=os.getenv("WEBAPP_SHORT_NAME") or None,
+        storage_chat_id=_int("STORAGE_CHAT_ID"),
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=_int("PORT", 8080),
+        data_dir=data_dir,
+        cache_max_bytes=int(float(os.getenv("CACHE_MAX_GB") or ("1" if lite else "10")) * 1024**3),
+        download_workers=_int("DOWNLOAD_WORKERS", 2 if lite else 3),
+        prefetch_per_import=_int("PREFETCH_PER_IMPORT", 0 if lite else 25),
+        max_import_tracks=_int("MAX_IMPORT_TRACKS", 500),
+        sync_interval_min=_int("SYNC_INTERVAL_MIN", 180),
+        sc_client_id=os.getenv("SC_CLIENT_ID") or None,
+        telegram_api_url=os.getenv("TELEGRAM_API_URL") or None,
+        dev_user_id=_int("DEV_USER_ID"),
+        lite_mode=lite,
+        # SoundCloud masters are AAC 160 / MP3 128 — encoding above ~192 only inflates the file
+        mp3_max_kbps=_int("MP3_MAX_KBPS", 192),
+        # opt-in: keep a copy of the SQLite DB in the storage channel (for ephemeral disks like Render free)
+        db_backup_min=_int("DB_BACKUP_MIN", 0),
+        secret=hashlib.sha256(b"vibecloud:" + secret_seed.encode()).digest(),
+    )

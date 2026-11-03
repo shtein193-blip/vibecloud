@@ -1,0 +1,7 @@
+vibecloud.example.com {
+	encode zstd gzip
+	# SSE (/api/events) и аудио-стриминг работают без буферизации
+	reverse_proxy vibecloud:8080 {
+		flush_interval -1
+	}
+}

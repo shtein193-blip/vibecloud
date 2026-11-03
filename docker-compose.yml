@@ -1,0 +1,36 @@
+services:
+  vibecloud:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8080:8080"   # наружу — через Caddy/nginx с HTTPS
+
+  # Необязательно: HTTPS «из коробки». Укажите домен в Caddyfile и раскомментируйте.
+  # caddy:
+  #   image: caddy:2
+  #   restart: unless-stopped
+  #   ports: ["80:80", "443:443"]
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - caddy_data:/data
+  #   depends_on: [vibecloud]
+
+  # Необязательно: свой Bot API server — файлы до 2 ГБ вместо 50 МБ.
+  # Получите api_id/api_hash на https://my.telegram.org и задайте TELEGRAM_API_URL=http://bot-api:8081
+  # bot-api:
+  #   image: aiogram/telegram-bot-api:latest
+  #   restart: unless-stopped
+  #   environment:
+  #     TELEGRAM_API_ID: "..."
+  #     TELEGRAM_API_HASH: "..."
+  #     TELEGRAM_LOCAL: "1"
+  #   volumes:
+  #     - ./data/bot-api:/var/lib/telegram-bot-api
+
+# volumes:
+#   caddy_data:

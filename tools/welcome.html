@@ -1,0 +1,39 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+@font-face{font-family:Anton;src:url(../webapp/fonts/Anton-400-latin.woff2) format("woff2");}
+@font-face{font-family:Fira;font-weight:900;src:url(../webapp/fonts/FiraSansExtraCondensed-900-cyrillic.woff2) format("woff2");unicode-range:U+0400-045F,U+0490-0491,U+04B0-04B1,U+2116;}
+@font-face{font-family:Fira;font-weight:900;src:url(../webapp/fonts/FiraSansExtraCondensed-900-latin.woff2) format("woff2");}
+@font-face{font-family:Manrope;font-weight:800;src:url(../webapp/fonts/Manrope-800-cyrillic.woff2) format("woff2");unicode-range:U+0400-045F;}
+@font-face{font-family:Manrope;font-weight:800;src:url(../webapp/fonts/Manrope-800-latin.woff2) format("woff2");}
+@font-face{font-family:Doto;font-weight:900;src:url(../webapp/fonts/Doto-900-latin.woff2) format("woff2");}
+*{box-sizing:border-box;margin:0}
+html,body{width:1280px;height:720px;overflow:hidden;background:#ece8df}
+.p{position:relative;width:1280px;height:720px;background:#ece8df;color:#1a1f8f;font-family:Manrope;overflow:hidden;isolation:isolate}
+.p::after{content:"";position:absolute;inset:0;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/></filter><rect width='160' height='160' filter='url(%23n)' opacity='.18'/></svg>");mix-blend-mode:multiply;pointer-events:none}
+.img{position:absolute;right:-60px;bottom:-40px;width:720px;mix-blend-mode:multiply;z-index:-1;
+ -webkit-mask-image:linear-gradient(90deg,transparent 0,#000 40%),linear-gradient(180deg,transparent 0,#000 30%);-webkit-mask-composite:source-in}
+.meta{position:absolute;left:56px;right:56px;top:44px;display:flex;justify-content:space-between;font:800 20px/1.3 Manrope;letter-spacing:.1em;text-transform:uppercase}
+.word{position:absolute;left:44px;top:96px;font:400 300px/.82 Anton;color:#2335e8;letter-spacing:-.01em}
+.word .s{position:absolute;inset:0;filter:url(#mb);opacity:.6;transform:translateX(40px);-webkit-mask-image:linear-gradient(90deg,transparent 40%,#000 80%)}
+.word2{position:absolute;left:52px;top:356px;font:400 132px/.82 Anton;color:#2335e8;letter-spacing:.02em}
+.tag{position:absolute;left:56px;bottom:150px;font:900 40px/1.02 Fira;text-transform:uppercase;color:#151515}
+.tag b{background:#e5412f;color:#ece8df;padding:0 8px}
+.pill{position:absolute;left:56px;bottom:56px;display:flex;gap:12px}
+.pill span{background:#151515;color:#ece8df;font:800 22px Manrope;padding:16px 26px;border-radius:40px}
+.pill span.l{background:#d6f35b;color:#141a00}
+.bar{position:absolute;right:56px;bottom:56px;display:flex;gap:3px;height:64px}
+.bar i{width:3px;background:#1a1f8f}.bar i:nth-child(3n){width:7px}.bar i:nth-child(5n){width:2px}
+.num{position:absolute;right:56px;bottom:132px;font:900 30px Doto;color:#1a1f8f}
+.star{position:absolute;width:40px;height:40px;color:#1a1f8f}
+</style></head><body>
+<svg width="0" height="0" style="position:absolute"><filter id="mb" x="-40%" y="-10%" width="180%" height="120%"><feGaussianBlur stdDeviation="34 0"/></filter></svg>
+<div class="p">
+  <img class="img" src="../webapp/img/hero.jpg">
+  <div class="meta"><span>SoundCloud → Telegram</span><span>Vol.01 · MMXXVI</span></div>
+  <div class="word">VIBE<span class="s">VIBE</span></div>
+  <div class="word2">CLOUD</div>
+  <svg class="star" style="left:720px;top:120px" viewBox="0 0 24 24"><path fill="currentColor" d="M12 1.5c.5 5.8 4.7 10 10.5 10.5-5.8.5-10 4.7-10.5 10.5C11.5 16.7 7.3 12.5 1.5 12 7.3 11.5 11.5 7.3 12 1.5z"/></svg>
+  <svg class="star" style="left:640px;top:420px;width:24px;height:24px" viewBox="0 0 24 24"><path fill="currentColor" d="M12 1.5c.5 5.8 4.7 10 10.5 10.5-5.8.5-10 4.7-10.5 10.5C11.5 16.7 7.3 12.5 1.5 12 7.3 11.5 11.5 7.3 12 1.5z"/></svg>
+  <div class="tag">Кинь ссылку —<br>получи <b>MP3</b> и плейлисты</div>
+  <div class="pill"><span class="l">Треки</span><span>Плейлисты</span><span>Лайки</span><span>Микстейпы</span></div>
+  <div class="bar"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+</div></body></html>

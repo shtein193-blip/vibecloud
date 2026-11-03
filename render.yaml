@@ -1,0 +1,27 @@
+# Render Blueprint: Dashboard → New → Blueprint → выберите этот репозиторий.
+# BOT_TOKEN и STORAGE_CHAT_ID Render спросит при создании (sync: false — их нет в репозитории).
+services:
+  - type: web
+    name: vibecloud
+    runtime: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: STORAGE_CHAT_ID
+        sync: false
+      - key: WEBAPP_SHORT_NAME
+        value: app
+      - key: LITE_MODE
+        value: "1"
+      - key: DOWNLOAD_WORKERS
+        value: "1"
+      - key: CACHE_MAX_GB
+        value: "0.5"
+      # Диск на бесплатном Render стирается при перезапуске. Чтобы медиатеки не терялись,
+      # поставьте 10: раз в 10 минут (если были изменения) копия базы уходит в ваш приватный канал.
+      - key: DB_BACKUP_MIN
+        value: "0"
