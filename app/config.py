@@ -24,6 +24,18 @@ def _int(name: str, default: int | None = None) -> int | None:
     return int(value) if value else default
 
 
+def _chat_id(name: str) -> int | None:
+    """Accepts '-1001234567890', '#-1001234567890' (copied from Telegram Web) or '1234567890'."""
+    raw = os.getenv(name, "").strip().strip("'\"").lstrip("#").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name}={raw!r}: нужен числовой ID канала вида -1001234567890, а не @username")
+    return value if value < 0 else int(f"-100{value}")
+
+
 def _bool(name: str, default: bool) -> bool:
     value = os.getenv(name, "").strip().lower()
     return default if not value else value in ("1", "true", "yes", "on")
@@ -85,7 +97,7 @@ def load_settings() -> Settings:
         public_url=(os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
                     or f"http://localhost:{os.getenv('PORT') or 8080}").rstrip("/"),
         webapp_short_name=os.getenv("WEBAPP_SHORT_NAME") or None,
-        storage_chat_id=_int("STORAGE_CHAT_ID"),
+        storage_chat_id=_chat_id("STORAGE_CHAT_ID"),
         host=os.getenv("HOST", "0.0.0.0"),
         port=_int("PORT", 8080),
         data_dir=data_dir,
@@ -101,6 +113,7 @@ def load_settings() -> Settings:
         # SoundCloud masters are AAC 160 / MP3 128 — encoding above ~192 only inflates the file
         mp3_max_kbps=_int("MP3_MAX_KBPS", 192),
         # opt-in: keep a copy of the SQLite DB in the storage channel (for ephemeral disks like Render free)
-        db_backup_min=_int("DB_BACKUP_MIN", 0),
+        # на Render диск стирается при перезапуске/деплое — там бэкап базы включён по умолчанию
+        db_backup_min=_int("DB_BACKUP_MIN", 10 if os.getenv("RENDER") else 0),
         secret=hashlib.sha256(b"vibecloud:" + secret_seed.encode()).digest(),
     )

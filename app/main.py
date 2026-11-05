@@ -43,7 +43,7 @@ async def setup_bot(ctx: Ctx):
     from aiogram.client.session.aiohttp import AiohttpSession
     from aiogram.client.telegram import TelegramAPIServer
     from aiogram.enums import ParseMode
-    from aiogram.types import BotCommand, LinkPreviewOptions, MenuButtonWebApp, WebAppInfo
+    from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
 
     from .bot import handlers, inline
     from .bot.sender import TelegramIO
@@ -56,6 +56,14 @@ async def setup_bot(ctx: Ctx):
         parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
     me = await bot.get_me()
     ctx.bot, ctx.bot_username = bot, me.username
+    log.info("bot @%s started", me.username)
+    if s.storage_chat_id:
+        try:
+            await bot.get_chat(s.storage_chat_id)
+        except Exception as ex:  # noqa: BLE001
+            log.error("STORAGE_CHAT_ID=%s недоступен (%s). Добавьте @%s администратором в этот канал "
+                      "и проверьте ID (вида -100…). Пока файлы будут загружаться через чат пользователя.",
+                      s.storage_chat_id, ex, me.username)
     ctx.tg = TelegramIO(ctx)
 
     await bot.set_my_commands([
@@ -76,6 +84,22 @@ async def setup_bot(ctx: Ctx):
     return bot, dp
 
 
+async def keepalive(url: str, minutes: int) -> None:
+    """Бесплатный Render усыпляет сервис через 15 минут без входящих HTTP-запросов — тогда бот молчит
+    (long polling остановлен), а Mini App показывает экран «Service waking up». Раз в N минут стучимся
+    в свой публичный адрес — для Render это обычный входящий запрос, и сервис не засыпает."""
+    import aiohttp
+    await asyncio.sleep(60)
+    async with aiohttp.ClientSession() as http:
+        while True:
+            try:
+                async with http.get(f"{url}/api/health", timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    await r.read()
+            except Exception as ex:  # noqa: BLE001
+                log.warning("keepalive: %s", ex)
+            await asyncio.sleep(minutes * 60)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     s = load_settings()
@@ -84,7 +108,10 @@ async def main() -> None:
         from aiogram import Bot as _Bot
 
         from .backup import restore
-        tmp_bot = _Bot(s.bot_token)
+        from aiogram.client.session.aiohttp import AiohttpSession
+        from aiogram.client.telegram import TelegramAPIServer
+        tmp_bot = _Bot(s.bot_token, session=AiohttpSession(
+            api=TelegramAPIServer.from_base(s.telegram_api_url, is_local=True)) if s.telegram_api_url else None)
         await restore(tmp_bot, s)
         await tmp_bot.session.close()
     db = DB(s.db_path)
@@ -108,6 +135,12 @@ async def main() -> None:
     await web.TCPSite(runner, s.host, s.port).start()
     log.info("Mini App: %s  (listening on %s:%s)", s.public_url, s.host, s.port)
     sync_task = asyncio.create_task(sync_loop(ctx))
+    import os
+    ka_min = int(os.getenv("KEEPALIVE_MIN") or (10 if os.getenv("RENDER") else 0))
+    ka_task = None
+    if ka_min > 0 and s.public_url.startswith("https://"):
+        ka_task = asyncio.create_task(keepalive(s.public_url, ka_min))
+        log.info("keepalive: self-ping every %d min", ka_min)
     backup = backup_task = None
     if backup_on and bot:
         from .backup import Backup
@@ -120,6 +153,8 @@ async def main() -> None:
             await asyncio.Event().wait()
     finally:
         sync_task.cancel()
+        if ka_task:
+            ka_task.cancel()
         if backup:  # Render sends SIGTERM on redeploy/restart — save the latest state before exit
             backup_task.cancel()
             try:
