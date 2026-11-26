@@ -19,6 +19,8 @@ from app.db import DB
 from app.downloader import Downloader
 from app.events import EventBus
 from app.importer import Importer
+from app.listimport import ListImporter
+from app.assistant import Ewa
 from app.security import Signer
 from app.soundcloud import SoundCloud
 from app.bot import handlers, inline
@@ -76,7 +78,8 @@ async def main():
     bus, signer = EventBus(), Signer(s.secret)
     sc = SoundCloud(); await sc.start()
     dl = Downloader(s, db, bus); await dl.start()
-    ctx = Ctx(settings=s, db=db, bus=bus, signer=signer, sc=sc, dl=dl, importer=Importer(s, db, sc, dl, bus, signer))
+    ctx = Ctx(settings=s, db=db, bus=bus, signer=signer, sc=sc, dl=dl, importer=Importer(s, db, sc, dl, bus, signer),
+              lists=ListImporter(s, db, sc, bus, signer), ewa=Ewa(s, db, sc, signer))
     bot = Bot("42:TEST", session=FakeSession(), default=DefaultBotProperties(parse_mode="HTML"))
     ctx.bot, ctx.bot_username = bot, (await bot.get_me()).username
     ctx.tg = TelegramIO(ctx)

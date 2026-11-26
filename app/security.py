@@ -21,3 +21,18 @@ class Signer:
 
     def verify(self, uid: int, tid: int, exp: int, sig: str) -> bool:
         return exp >= time.time() and hmac.compare_digest(self._mac(uid, tid, exp), sig)
+
+    # SSE (EventSource can't send headers): a long-lived token instead of initData in the URL
+    def event_token(self, uid: int, ttl: int = 7 * 86400) -> str:
+        exp = int(time.time()) + ttl
+        return f"{uid}.{exp}.{self._mac('ev', uid, exp)}"
+
+    def verify_event(self, token: str) -> int | None:
+        try:
+            uid, exp, sig = token.split(".")
+            uid_i, exp_i = int(uid), int(exp)
+        except ValueError:
+            return None
+        if exp_i < time.time() or not hmac.compare_digest(self._mac("ev", uid_i, exp_i), sig):
+            return None
+        return uid_i

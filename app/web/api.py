@@ -1,23 +1,30 @@
 from __future__ import annotations
 
-import asyncio
+import gzip
 import json
 import logging
+import time
 from pathlib import Path
 from urllib.parse import quote
 
 from aiohttp import web
 
+import asyncio
+
+from .. import social
 from ..context import Ctx
 from ..downloader import DownloadError
 from ..importer import NeedChoice
+from ..listimport import parse_tracklist
 from ..serialize import configure as configure_serializer, mixtape_out, playlist_out, track_out
 from ..soundcloud import SoundCloudError, extract_links, track_meta
+from ..tasks import TTLCache, spawn
 
 log = logging.getLogger(__name__)
 WEBAPP_DIR = Path(__file__).resolve().parents[2] / "webapp"
 CTX = web.AppKey("ctx", Ctx)
 THEMES = {"cobalt", "red", "smoke", "lime", "paper"}
+INIT_MAX_AGE = 48 * 3600  # initData older than this is rejected (re-open the Mini App)
 
 
 # ---------------- auth ----------------
@@ -31,6 +38,8 @@ def _auth_user(request: web.Request) -> dict:
             data = safe_parse_webapp_init_data(ctx.settings.bot_token, init_data)
         except ValueError:
             raise web.HTTPUnauthorized(text="bad initData")
+        if time.time() - data.auth_date.timestamp() > INIT_MAX_AGE:
+            raise web.HTTPUnauthorized(text="Сессия устарела — закрой и снова открой приложение")
         u = data.user
         return {"id": u.id, "first_name": u.first_name, "username": u.username,
                 "language_code": u.language_code, "photo_url": u.photo_url,
@@ -40,16 +49,26 @@ def _auth_user(request: web.Request) -> dict:
     raise web.HTTPUnauthorized(text="open from Telegram")
 
 
+PUBLIC_API = ("/api/stream/", "/api/file/", "/api/health", "/api/events")
+
+
 @web.middleware
 async def auth_mw(request: web.Request, handler):
     path = request.path
-    if path.startswith("/api/") and not path.startswith(("/api/stream/", "/api/file/", "/api/health")):
-        user = _auth_user(request)
+    ctx: Ctx = request.app[CTX]
+    if path.startswith("/api/") and not path.startswith("/api/health") and not ctx.ready:
+        return web.json_response({"error": "Сервер просыпается — ещё пару секунд…", "retry": True}, status=503,
+                                 headers={"Retry-After": "3"})
+    if path.startswith("/api/") and not path.startswith(PUBLIC_API):
+        try:
+            user = _auth_user(request)
+        except web.HTTPUnauthorized as ex:
+            return web.json_response({"error": ex.text or "Открой приложение из Telegram"}, status=401)
         request["user"] = user
-        await request.app[CTX].db.upsert_user(user)
+        await ctx.db.upsert_user(user)
     try:
         return await handler(request)
-    except (SoundCloudError, DownloadError) as ex:
+    except (SoundCloudError, DownloadError, ValueError) as ex:
         return web.json_response({"error": str(ex)}, status=400)
 
 
@@ -70,23 +89,33 @@ async def bootstrap(request: web.Request):
     playlists = [playlist_out(p) for p in await ctx.db.user_playlists(uid)]
     mixtapes = [mixtape_out(m, await ctx.db.mixtape_tracks(m["code"])) for m in await ctx.db.user_mixtapes(uid)]
     jobs = await ctx.db.user_jobs(uid)
+    me = await ctx.db.get_user(uid) or {}
+    duos = [social.duo_out(d, uid) for d in await ctx.db.user_duos(uid)]
     return ok({
-        "user": request["user"],
-        "stats": await ctx.db.stats(uid, tz),
-        "tracks": tracks, "playlists": playlists, "mixtapes": mixtapes,
+        "user": {**request["user"], "status": me.get("status"), "hidden": bool(me.get("hidden")),
+                 "admin": ctx.is_admin(uid)},
+        "stats": {**await ctx.db.stats(uid, tz), "rank": (await ctx.db.my_rank(uid, "week"))["rank"]},
+        "tracks": tracks, "playlists": playlists, "mixtapes": mixtapes, "duos": duos,
+        "events_token": ctx.signer.event_token(uid),
         "jobs": [{k: j[k] for k in ("id", "kind", "title", "artwork", "total", "added", "status", "created_at",
                                      "playlist_id")} for j in jobs],
         "config": {"bot": ctx.bot_username, "app_link": ctx.app_link(""),
                    "storage": bool(ctx.settings.storage_chat_id),
                    # lite: play straight from SoundCloud's CDN, "download" = MP3 into the chat from Telegram
-                   "lite": ctx.settings.lite_mode, "direct": ctx.settings.lite_mode},
+                   "lite": ctx.settings.lite_mode, "direct": ctx.settings.lite_mode,
+                   "ai": ctx.settings.ai_enabled, "list_max": ctx.settings.list_import_max},
     })
 
 
 # ---------------- events (SSE) ----------------
 async def events(request: web.Request):
     ctx: Ctx = request.app[CTX]
-    uid = uid_of(request)
+    uid = ctx.signer.verify_event(request.query.get("t", ""))
+    if uid is None:  # old clients still send initData
+        try:
+            uid = _auth_user(request)["id"]
+        except web.HTTPUnauthorized:
+            raise web.HTTPUnauthorized(text="bad token")
     resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache",
                                        "X-Accel-Buffering": "no"})
     await resp.prepare(request)
@@ -141,7 +170,7 @@ async def start_import(request: web.Request):
             ctx.bus.publish(uid, "import_error", {"url": url, "error": str(ex)})
 
     for url in links[:5]:
-        asyncio.create_task(runner(url))
+        spawn(runner(url), "import")
     return ok(started=len(links[:5]))
 
 
@@ -202,7 +231,7 @@ async def track_send(request: web.Request):
             await ctx.tg.send_track(uid, row["id"], uid)
         except Exception as ex:  # noqa: BLE001
             ctx.bus.publish(uid, "toast", {"text": f"Не вышло отправить: {ex}"})
-    asyncio.create_task(go())
+    spawn(go(), "send")
     return ok()
 
 
@@ -248,12 +277,14 @@ async def track_direct(request: web.Request):
 
 async def track_waveform(request: web.Request):
     ctx, uid, row = await _owned_track(request)
-    cache = request.app["wave_cache"]
-    if row["id"] not in cache:
-        cache[row["id"]] = await ctx.sc.waveform(row.get("waveform_url"), int(request.query.get("bars", 96)))
-        if len(cache) > 2000:
-            cache.pop(next(iter(cache)))
-    return ok({"bars": cache[row["id"]]})
+    cache: TTLCache = request.app["wave_cache"]
+    bars = max(16, min(int(request.query.get("bars", 96) or 96), 200))
+    key = (row["id"], bars)
+    packed = cache.get(key)
+    if packed is None:  # store as bytes (1 byte per bar) — 25× smaller than a list of floats
+        packed = bytes(round(v * 255) for v in await ctx.sc.waveform(row.get("waveform_url"), bars))
+        cache[key] = packed
+    return ok({"bars": [round(b / 255, 3) for b in packed]})
 
 
 async def _signed_path(request: web.Request) -> tuple[Path, dict]:
@@ -322,7 +353,7 @@ async def playlist_send(request: web.Request):
         status = await ctx.bot.send_message(uid, f"📤 Готовлю <b>{e(pl['title'])}</b>: 0/{len(tids)}")
         sent, failed = await ctx.tg.send_many(uid, tids, uid, status=status)
         await status.edit_text(f"✓ Отправил {sent} из {len(tids)}" + (f" · не вышло: {failed}" if failed else ""))
-    asyncio.create_task(go())
+    spawn(go(), "send-playlist")
     return ok(count=len(tids))
 
 
@@ -348,15 +379,11 @@ async def search(request: web.Request):
     if len(q) < 2:
         return ok({"results": []})
     raw = await ctx.sc.search(q, 20)
-    out = []
-    for t in raw:
-        m = track_meta(t)
-        if not m["available"]:
-            continue
-        await ctx.db.upsert_track(m)
-        entry = await ctx.db.library_entry(uid, m["id"])
-        row = entry or await ctx.db.get_track(m["id"])
-        out.append({**track_out(row, uid, ctx.signer), "in_library": bool(entry)})
+    metas = [m for m in (track_meta(t) for t in raw) if m["available"]]
+    await ctx.db.upsert_tracks(metas)
+    rows = await ctx.db.library_entries(uid, [m["id"] for m in metas])
+    out = [{**track_out(rows[m["id"]], uid, ctx.signer), "in_library": rows[m["id"]].get("added_at") is not None}
+           for m in metas if m["id"] in rows]
     return ok({"results": out})
 
 
@@ -466,19 +493,199 @@ async def mixtape_delete(request: web.Request):
     return ok()
 
 
+# ---------------- listening time (leaderboard) ----------------
+async def listen(request: web.Request):
+    """Heartbeat from the player: real seconds listened since the previous beat (server caps cheating)."""
+    ctx: Ctx = request.app[CTX]
+    uid = uid_of(request)
+    body = await _body(request)
+    try:
+        sec = int(float(body.get("seconds") or 0))
+    except (TypeError, ValueError):
+        sec = 0
+    last: TTLCache = request.app["listen_last"]
+    prev = last.get(uid)
+    nowm = time.monotonic()
+    cap = 75 if prev is None else min(nowm - prev + 10, 330)
+    sec = max(0, min(sec, int(cap)))
+    last[uid] = nowm
+    if sec:
+        await ctx.db.add_listen_time(uid, sec)
+    return ok(counted=sec)
+
+
+# ---------------- list import (Yandex Music & co) ----------------
+async def import_list(request: web.Request):
+    ctx: Ctx = request.app[CTX]
+    uid = uid_of(request)
+    body = await _body(request)
+    text = str(body.get("text") or "")
+    items = parse_tracklist(text)
+    if not items:
+        return web.json_response({"error": "Не нашёл треков. Нужен список «Исполнитель — Название» по строке, "
+                                           "CSV/JSON или текст, скопированный со страницы плейлиста"}, status=400)
+    if uid in ctx.lists.running:
+        return web.json_response({"error": "Предыдущий список ещё переносится"}, status=409)
+
+    async def go():
+        try:
+            await ctx.lists.run(uid, text, body.get("title"))
+        except Exception as ex:  # noqa: BLE001
+            ctx.bus.publish(uid, "import_error", {"url": "list", "error": str(ex)})
+    spawn(go(), "list-import")
+    return ok(count=min(len(items), ctx.settings.list_import_max), total=len(items),
+              sample=items[:5])
+
+
+async def list_preview(request: web.Request):
+    body = await _body(request)
+    items = parse_tracklist(str(body.get("text") or ""))
+    return ok(count=len(items), sample=items[:5])
+
+
+async def job_get(request: web.Request):
+    ctx: Ctx = request.app[CTX]
+    j = await ctx.db.one("SELECT * FROM jobs WHERE id=? AND user_id=?", (request.match_info["jid"], uid_of(request)))
+    if not j:
+        raise web.HTTPNotFound(text="job not found")
+    return ok({k: j[k] for k in ("id", "kind", "title", "total", "added", "status", "playlist_id", "created_at")}
+              | {"missing": json.loads(j["report"] or "[]")})
+
+
+# ---------------- Ewa ----------------
+async def ewa(request: web.Request):
+    ctx: Ctx = request.app[CTX]
+    body = await _body(request)
+    hist = body.get("history") if isinstance(body.get("history"), list) else []
+    return ok(await ctx.ewa.reply(uid_of(request), str(body.get("text") or ""), hist))
+
+
+# ---------------- leaderboard, statuses, profiles ----------------
+async def leaders(request: web.Request):
+    ctx: Ctx = request.app[CTX]
+    return ok(await social.leaderboard(ctx, uid_of(request), request.query.get("period", "week")))
+
+
+async def me_hidden(request: web.Request):
+    ctx: Ctx = request.app[CTX]
+    hidden = bool((await _body(request)).get("hidden"))
+    await ctx.db.set_hidden(uid_of(request), hidden)
+    return ok(hidden=hidden)
+
+
+async def admin_status(request: web.Request):
+    ctx: Ctx = request.app[CTX]
+    if not ctx.is_admin(uid_of(request)):
+        raise web.HTTPForbidden(text="только для администратора")
+    body = await _body(request)
+    user = await social.set_status(ctx, int(body.get("user_id") or 0), body.get("status"), by=uid_of(request))
+    if not user:
+        raise web.HTTPNotFound(text="user not found")
+    return ok(status=user["status"])
+
+
+async def user_profile(request: web.Request):
+    ctx: Ctx = request.app[CTX]
+    uid = uid_of(request)
+    tid = int(request.match_info["uid"])
+    u = await ctx.db.get_user(tid)
+    if not u or (u.get("hidden") and tid != uid and not ctx.is_admin(uid)):
+        raise web.HTTPNotFound(text="user not found")
+    week, total = await ctx.db.my_rank(tid, "week"), await ctx.db.my_rank(tid, "all")
+    st = await ctx.db.stats(tid)
+    duo = next((social.duo_out(d, uid) for d in await ctx.db.user_duos(uid)
+                if tid in (d["a"], d["b"])), None)
+    return ok({**social.user_out(u), "week_minutes": round(week["seconds"] / 60),
+               "total_minutes": round(total["seconds"] / 60), "rank": week["rank"], "tracks": st["tracks"],
+               "top_genres": st["top_genres"], "match": await ctx.db.taste_match(uid, tid) if tid != uid else None,
+               "duo": duo, "me": tid == uid})
+
+
+# ---------------- duo playlists ----------------
+async def _duo(request: web.Request) -> tuple[Ctx, int, dict]:
+    ctx: Ctx = request.app[CTX]
+    uid = uid_of(request)
+    d = await social.member_duo(ctx, uid, request.match_info["did"])
+    if not d:
+        raise web.HTTPNotFound(text="Парный плейлист не найден")
+    return ctx, uid, d
+
+
+async def duos_list(request: web.Request):
+    ctx: Ctx = request.app[CTX]
+    uid = uid_of(request)
+    return ok({"duos": [social.duo_out(d, uid) for d in await ctx.db.user_duos(uid)]})
+
+
+async def duos_create(request: web.Request):
+    ctx: Ctx = request.app[CTX]
+    body = await _body(request)
+    return ok(await social.invite(ctx, uid_of(request), int(body.get("user_id") or 0), str(body.get("title") or "")))
+
+
+async def duo_get(request: web.Request):
+    ctx, uid, d = await _duo(request)
+    return ok(await social.duo_detail(ctx, uid, d))
+
+
+async def duo_respond(request: web.Request):
+    ctx: Ctx = request.app[CTX]
+    accept = request.match_info["action"] == "accept"
+    res = await social.respond(ctx, uid_of(request), request.match_info["did"], accept)
+    if not res:
+        raise web.HTTPNotFound(text="Приглашение уже неактуально")
+    return ok(res)
+
+
+async def duo_add(request: web.Request):
+    ctx, uid, d = await _duo(request)
+    if d["state"] != "active":
+        return web.json_response({"error": "Сначала друг должен принять приглашение"}, status=400)
+    ids = [int(x) for x in (await _body(request)).get("track_ids", []) if str(x).isdigit()]
+    return ok(added=await social.add_tracks(ctx, uid, d, ids))
+
+
+async def duo_fill(request: web.Request):
+    ctx, uid, d = await _duo(request)
+    if d["state"] != "active":
+        return web.json_response({"error": "Сначала друг должен принять приглашение"}, status=400)
+    return ok(added=await social.fill_common(ctx, uid, d))
+
+
+async def duo_remove_track(request: web.Request):
+    ctx, uid, d = await _duo(request)
+    await ctx.db.remove_duo_track(d["id"], int(request.match_info["tid"]))
+    return ok()
+
+
+async def duo_delete(request: web.Request):
+    ctx, uid, d = await _duo(request)
+    await ctx.db.delete_duo(d["id"])
+    other = d["b"] if d["a"] == uid else d["a"]
+    ctx.bus.publish(other, "duo_gone", {"id": d["id"]})
+    return ok()
+
+
 # ---------------- static ----------------
 async def index(request: web.Request):
     return web.FileResponse(WEBAPP_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 async def health(request: web.Request):
-    return ok(status="ok")
+    ctx: Ctx = request.app[CTX]
+    return web.json_response({"ok": True, "status": "ok", "instance": request.app["instance"], "ready": ctx.ready},
+                             headers={"Cache-Control": "no-store"})
 
 
 @web.middleware
 async def cache_mw(request: web.Request, handler):
-    """Let Telegram's webview keep static assets: fonts/images for a month, code for an hour (+ETag)."""
+    """Let Telegram's webview keep static assets: fonts/images for a month, code for an hour (+ETag).
+    JSON answers are gzipped: a 500-track library shrinks ~8× on mobile networks."""
     resp = await handler(request)
+    if (type(resp) is web.Response and resp.body is not None and len(resp.body) > 1400
+            and "gzip" in request.headers.get("Accept-Encoding", "")
+            and (resp.content_type or "").startswith(("application/json", "text/"))):
+        resp.enable_compression(web.ContentCoding.gzip)
     path = request.path
     if path.startswith(("/fonts/", "/img/", "/js/vendor/")):
         resp.headers.setdefault("Cache-Control", "public, max-age=2592000, immutable")
@@ -487,11 +694,26 @@ async def cache_mw(request: web.Request, handler):
     return resp
 
 
-def create_web_app(ctx: Ctx) -> web.Application:
+def _precompress_static() -> None:
+    """aiohttp serves `file.js.gz` instead of `file.js` to clients that accept gzip — do it once at start."""
+    for ext in ("*.js", "*.css", "*.html", "*.svg"):
+        for f in WEBAPP_DIR.rglob(ext):
+            gz = f.with_name(f.name + ".gz")
+            try:
+                if not gz.exists() or gz.stat().st_mtime < f.stat().st_mtime:
+                    gz.write_bytes(gzip.compress(f.read_bytes(), 9, mtime=0))
+            except OSError:
+                return  # read-only filesystem — just serve uncompressed
+
+
+def create_web_app(ctx: Ctx, instance: str = "dev") -> web.Application:
     configure_serializer(ctx.settings.lite_mode)
-    app = web.Application(middlewares=[cache_mw, auth_mw], client_max_size=2 * 1024 * 1024)
+    _precompress_static()
+    app = web.Application(middlewares=[cache_mw, auth_mw], client_max_size=4 * 1024 * 1024)
     app[CTX] = ctx
-    app["wave_cache"] = {}
+    app["instance"] = instance
+    app["wave_cache"] = TTLCache(maxsize=3000, ttl=7 * 86400)
+    app["listen_last"] = TTLCache(maxsize=20000, ttl=3600)
     r = app.router
     r.add_get("/", index)
     r.add_get("/api/health", health)
@@ -521,6 +743,23 @@ def create_web_app(ctx: Ctx) -> web.Application:
     r.add_post("/api/mixtape/{code}/claim", mixtape_claim)
     r.add_post("/api/mixtape/{code}/share", mixtape_share)
     r.add_delete("/api/mixtape/{code}", mixtape_delete)
+    r.add_post("/api/listen", listen)
+    r.add_post("/api/import/list", import_list)
+    r.add_post("/api/import/list/preview", list_preview)
+    r.add_get("/api/job/{jid}", job_get)
+    r.add_post("/api/ewa", ewa)
+    r.add_get("/api/leaders", leaders)
+    r.add_post("/api/me/hidden", me_hidden)
+    r.add_post("/api/admin/status", admin_status)
+    r.add_get("/api/user/{uid}", user_profile)
+    r.add_get("/api/duos", duos_list)
+    r.add_post("/api/duos", duos_create)
+    r.add_get("/api/duo/{did}", duo_get)
+    r.add_post("/api/duo/{did}/add", duo_add)
+    r.add_post("/api/duo/{did}/fill", duo_fill)
+    r.add_post("/api/duo/{did}/{action:accept|decline}", duo_respond)
+    r.add_delete("/api/duo/{did}/track/{tid}", duo_remove_track)
+    r.add_delete("/api/duo/{did}", duo_delete)
     for sub in ("css", "js", "fonts", "img"):
         r.add_static(f"/{sub}/", WEBAPP_DIR / sub, append_version=False)
     return app

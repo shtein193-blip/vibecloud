@@ -3,17 +3,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import secrets
+import sys
 
 from aiohttp import web
 
+from .assistant import Ewa
 from .config import load_settings
 from .context import Ctx
 from .db import DB
 from .downloader import Downloader
 from .events import EventBus
 from .importer import Importer
+from .listimport import ListImporter
 from .security import Signer
 from .soundcloud import SoundCloud
+from .tasks import spawn
 from .web.api import create_web_app
 
 log = logging.getLogger("vibecloud")
@@ -26,7 +32,11 @@ async def sync_loop(ctx: Ctx) -> None:
     await asyncio.sleep(30)
     while True:
         for pl in await ctx.db.watched_playlists():
-            fresh = await ctx.importer.sync_playlist(pl)
+            try:
+                fresh = await ctx.importer.sync_playlist(pl)
+            except Exception as ex:  # noqa: BLE001
+                log.warning("sync %s: %s", pl["id"], ex)
+                continue
             if fresh and ctx.tg:
                 names = "\n".join(f"• {e(r['artist'])} — {e(r['title'])}" for r in fresh[:5])
                 await ctx.tg.notify(
@@ -70,6 +80,8 @@ async def setup_bot(ctx: Ctx):
         BotCommand(command="start", description="Начать"),
         BotCommand(command="library", description="Моя медиатека"),
         BotCommand(command="search", description="Найти трек"),
+        BotCommand(command="ewa", description="Спросить Ewa — музыкального ассистента"),
+        BotCommand(command="top", description="Топ слушателей"),
         BotCommand(command="help", description="Какие ссылки я понимаю"),
     ])
     await bot.set_my_short_description("Переношу треки и плейлисты из SoundCloud в Telegram 🎧")
@@ -100,29 +112,68 @@ async def keepalive(url: str, minutes: int) -> None:
             await asyncio.sleep(minutes * 60)
 
 
+async def update_ytdlp() -> None:
+    """SoundCloud changes often; a fresh yt-dlp on every start keeps downloads working without a rebuild."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pip", "install", "-q", "-U", "--no-cache-dir", "yt-dlp",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await asyncio.wait_for(proc.communicate(), 180)
+        if proc.returncode == 0:
+            log.info("yt-dlp is up to date")
+        else:
+            log.info("yt-dlp update skipped: %s", (err or b"").decode(errors="ignore")[-200:])
+    except Exception as ex:  # noqa: BLE001
+        log.info("yt-dlp update skipped: %s", ex)
+
+
+def _bot_for_restore(s):
+    from aiogram import Bot
+    from aiogram.client.session.aiohttp import AiohttpSession
+    from aiogram.client.telegram import TelegramAPIServer
+    return Bot(s.bot_token, session=AiohttpSession(
+        api=TelegramAPIServer.from_base(s.telegram_api_url, is_local=True)) if s.telegram_api_url else None)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
     s = load_settings()
+    instance = (os.getenv("RENDER_INSTANCE_ID") or secrets.token_hex(4))[-12:]
     backup_on = bool(s.bot_enabled and s.storage_chat_id and s.db_backup_min > 0)
-    if backup_on:  # fresh container on an ephemeral disk → bring the library back first
-        from aiogram import Bot as _Bot
 
-        from .backup import restore
-        from aiogram.client.session.aiohttp import AiohttpSession
-        from aiogram.client.telegram import TelegramAPIServer
-        tmp_bot = _Bot(s.bot_token, session=AiohttpSession(
-            api=TelegramAPIServer.from_base(s.telegram_api_url, is_local=True)) if s.telegram_api_url else None)
-        await restore(tmp_bot, s)
-        await tmp_bot.session.close()
     db = DB(s.db_path)
-    await db.connect()
     bus, signer = EventBus(), Signer(s.secret)
     sc = SoundCloud(s.sc_client_id)
-    await sc.start()
     dl = Downloader(s, db, bus)
-    await dl.start()
     ctx = Ctx(settings=s, db=db, bus=bus, signer=signer, sc=sc, dl=dl,
-              importer=Importer(s, db, sc, dl, bus, signer))
+              importer=Importer(s, db, sc, dl, bus, signer), lists=ListImporter(s, db, sc, bus, signer),
+              ewa=Ewa(s, db, sc, signer), ready=False)
+
+    # 1) web server first: Render needs a healthy /api/health before it switches traffic to us
+    app = create_web_app(ctx, instance)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, s.host, s.port).start()
+    log.info("Mini App: %s  (listening on %s:%s, instance %s)", s.public_url, s.host, s.port, instance)
+
+    # 2) fresh container on an ephemeral disk → bring the library back (after the old instance hands over)
+    restored_msg = None
+    if backup_on and not s.db_path.exists():
+        from .backup import handover, restore
+        tmp_bot = _bot_for_restore(s)
+        try:
+            await handover(tmp_bot, s, instance)
+            restored_msg = await restore(tmp_bot, s)
+        finally:
+            await tmp_bot.session.close()
+
+    # 3) open everything and start serving
+    await db.connect()
+    await sc.start()
+    await dl.start()
+    ctx.ready = True
+    log.info("ready")
 
     bot = dp = None
     if s.bot_enabled:
@@ -130,22 +181,19 @@ async def main() -> None:
     else:
         log.warning("BOT_TOKEN is empty — running web/API only (set DEV_USER_ID for local testing)")
 
-    runner = web.AppRunner(create_web_app(ctx))
-    await runner.setup()
-    await web.TCPSite(runner, s.host, s.port).start()
-    log.info("Mini App: %s  (listening on %s:%s)", s.public_url, s.host, s.port)
-    sync_task = asyncio.create_task(sync_loop(ctx))
-    import os
-    ka_min = int(os.getenv("KEEPALIVE_MIN") or (10 if os.getenv("RENDER") else 0))
+    sync_task = spawn(sync_loop(ctx), "sync")
+    if s.ytdlp_autoupdate:
+        spawn(update_ytdlp(), "ytdlp-update")
+    ka_min = int(os.getenv("KEEPALIVE_MIN") or (10 if s.on_render else 0))
     ka_task = None
     if ka_min > 0 and s.public_url.startswith("https://"):
-        ka_task = asyncio.create_task(keepalive(s.public_url, ka_min))
+        ka_task = spawn(keepalive(s.public_url, ka_min), "keepalive")
         log.info("keepalive: self-ping every %d min", ka_min)
     backup = backup_task = None
     if backup_on and bot:
         from .backup import Backup
-        backup = Backup(bot, db, s)
-        backup_task = asyncio.create_task(backup.loop())
+        backup = Backup(bot, db, s, instance, restored_msg)
+        backup_task = spawn(backup.loop(), "backup")
     try:
         if dp:
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
@@ -155,14 +203,15 @@ async def main() -> None:
         sync_task.cancel()
         if ka_task:
             ka_task.cancel()
-        if backup:  # Render sends SIGTERM on redeploy/restart — save the latest state before exit
+        if backup:  # Render sends SIGTERM on redeploy/restart — hand the latest state to the next instance
             backup_task.cancel()
             try:
-                await asyncio.wait_for(backup.snapshot(), 20)
+                await asyncio.wait_for(backup.snapshot(final=True), 20)
             except Exception as ex:  # noqa: BLE001
                 log.warning("final DB snapshot failed: %s", ex)
         await dl.stop()
         await runner.cleanup()
+        await ctx.ewa.close()
         await sc.close()
         await db.close()
         if bot:

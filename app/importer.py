@@ -105,6 +105,7 @@ class Importer:
                 self.bus.publish(uid, "job", {"id": job_id, "status": "error", "error": str(e)})
             raise
         metas = [track_meta(t) for t in raw]
+        metas = list({m["id"]: m for m in metas}.values())
         await self.db.update_job(job_id, total=len(metas))
         if own_job:
             self.bus.publish(uid, "job", {"id": job_id, "status": "running", "kind": r.kind, "title": r.title,
@@ -118,20 +119,28 @@ class Importer:
                 "permalink": r.data.get("permalink_url") or r.url, "source_url": r.url,
             })
 
-        added_rows, new_count = [], 0
+        # batch: one transaction for all tracks, one for the library, one SELECT for the rows
+        ids = list(dict.fromkeys(m["id"] for m in metas))
+        await self.db.upsert_tracks(metas)
+        fresh = await self.db.add_many_to_library(uid, ids)
+        rows = await self.db.library_entries(uid, ids)
+        new_count = len(fresh)
         prefetch_budget = self.s.prefetch_per_import
-        for m in metas:
-            await self.db.upsert_track(m)
-            if await self.db.add_to_library(uid, m["id"]):
-                new_count += 1
-            row = await self.db.library_entry(uid, m["id"])
-            added_rows.append(row)
-            if m["available"] and prefetch_budget > 0 and row["status"] not in ("ready",) \
-                    and not row["tg_file_id"]:
+        batch: list[dict] = []
+        for tid in ids:
+            row = rows.get(tid)
+            if not row:
+                continue
+            if row["status"] not in ("ready", "unavailable") and prefetch_budget > 0 and not row["tg_file_id"]:
                 prefetch_budget -= 1
-                self.dl.prefetch(m["id"])
-            self.bus.publish(uid, "track_added", {"job": job_id, "playlist": playlist_id,
-                                                  "track": track_out(row, uid, self.signer)})
+                self.dl.prefetch(tid)
+            batch.append(track_out(row, uid, self.signer))
+            if len(batch) >= 40:
+                self.bus.publish(uid, "tracks_added", {"job": job_id, "playlist": playlist_id, "tracks": batch})
+                batch = []
+                await asyncio.sleep(0)
+        if batch:
+            self.bus.publish(uid, "tracks_added", {"job": job_id, "playlist": playlist_id, "tracks": batch})
         if playlist_id:
             await self.db.set_playlist_tracks(playlist_id, [m["id"] for m in metas])
             await self.db.update_job(job_id, playlist_id=playlist_id)
@@ -185,17 +194,16 @@ class Importer:
             return []
         metas = [track_meta(t) for t in raw]
         uid = pl["user_id"]
-        for m in metas:
-            await self.db.upsert_track(m)
-        fresh = await self.db.set_playlist_tracks(pl["id"], [m["id"] for m in metas])
-        rows = []
-        for tid in fresh:
-            await self.db.add_to_library(uid, tid)
-            row = await self.db.library_entry(uid, tid)
-            rows.append(row)
+        await self.db.upsert_tracks(metas)
+        fresh = await self.db.set_playlist_tracks(pl["id"], list(dict.fromkeys(m["id"] for m in metas)))
+        await self.db.add_many_to_library(uid, fresh)
+        entries = await self.db.library_entries(uid, fresh)
+        rows = [entries[t] for t in fresh if t in entries]
+        for row in rows:
             if row["status"] != "unavailable" and self.s.prefetch_per_import > 0 and not row["tg_file_id"]:
-                self.dl.prefetch(tid)
-            self.bus.publish(uid, "track_added", {"job": None, "playlist": pl["id"],
-                                                  "track": track_out(row, uid, self.signer)})
+                self.dl.prefetch(row["id"])
+        if rows:
+            self.bus.publish(uid, "tracks_added", {"job": None, "playlist": pl["id"],
+                                                   "tracks": [track_out(r, uid, self.signer) for r in rows]})
         await self.db.run("UPDATE playlists SET synced_at=strftime('%s','now') WHERE id=?", (pl["id"],))
         return rows

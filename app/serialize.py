@@ -35,7 +35,8 @@ def track_out(row: dict, uid: int, signer: Signer, base: str = "") -> dict:
         "play_count": row.get("play_count") or 0,
         "added_at": row.get("added_at"),
         "stream": f"{base}/api/stream/{tid}?{q}",
-        "file": f"{base}/api/file/{tid}?{q}",
+        # LITE: "download" means "MP3 into the chat", the direct file link is never used — keep payloads small
+        **({} if LITE["on"] else {"file": f"{base}/api/file/{tid}?{q}"}),
     }
 
 

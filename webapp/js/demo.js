@@ -92,9 +92,66 @@ const mxOut = (m, full = false) => {
   return o;
 };
 const tOut = (t) => ({ ...t, in_library: DB.library.includes(t.id) });
+/* ---- v2 demo data: leaderboard, duos (all people here are fictional) ---- */
+const PEOPLE = [
+  { id: 2, name: 'Маша', status: '👑 Легенда', min: 1840, genres: ['House', 'Indie'] },
+  { id: 3, name: 'Тимур', status: '🎧 Диджей', min: 1512, genres: ['Techno'] },
+  { id: 1, name: 'Алекс', status: '🔥 Меломан', min: 1290, genres: ['Post-Punk', 'Synthwave'] },
+  { id: 4, name: 'Соня', status: null, min: 990, genres: ['Dream Pop'] },
+  { id: 5, name: 'Даня', status: '🌙 Ночной слушатель', min: 760, genres: ['Ambient'] },
+  { id: 6, name: 'Вика', status: null, min: 410, genres: ['Electronic'] },
+  { id: 7, name: 'Лёша', status: null, min: 205, genres: ['Synthwave'] },
+];
+let meHidden = false, listenedSec = 1290 * 60;
+const person = (id) => PEOPLE.find((x) => x.id === id);
+const pOut = (x, k = 1) => ({ id: x.id, name: x.name, photo: null, status: x.status, minutes: Math.round(x.min * k) });
+DB.duos = [
+  { id: 'd1', title: 'Алекс + Маша: дорога на юг', a: 1, b: 2, state: 'active', ids: [105, 109, 118, 101], by: { 105: 2, 109: 1, 118: 2, 101: 1 } },
+  { id: 'd2', title: 'Ночные смены', a: 5, b: 1, state: 'pending', ids: [], by: {} },
+];
+const duoOut = (d, full = false) => {
+  const partner = person(d.a === 1 ? d.b : d.a), ts = d.ids.map((x) => DB.tracks.get(x)).filter(Boolean);
+  const o = { id: d.id, title: d.title, state: d.state, incoming: d.state === 'pending' && d.b === 1, partner: pOut(partner), me: pOut(person(1)),
+    track_count: ts.length, duration: ts.reduce((s2, t) => s2 + t.duration, 0), artwork: ts[0] ? ts[0].artwork : null };
+  if (full) { o.match = 42; o.tracks = ts.map((t) => ({ ...tOut(t), added_by: d.by[t.id] || 1, added_by_name: (d.by[t.id] || 1) === 1 ? 'ты' : partner.name })); }
+  return o;
+};
+const LIST_JOBS = {};
+function demoParse(text) {
+  return String(text || '').split(/\r?\n/).map((l) => l.replace(/^\s*\d+[.)]\s*/, '').trim()).filter(Boolean)
+    .map((l) => { const m = l.split(/\s+[—–-]\s+/); return m.length > 1 ? { artist: m[0], title: m.slice(1).join(' - ') } : { artist: '', title: l }; })
+    .filter((x) => x.title && !/^\d+:\d\d$/.test(x.title));
+}
+function runList(text, title) {
+  const items = demoParse(text).slice(0, 40), jid = 'L' + (++seq), name = title || 'Яндекс Музыка';
+  const ids = [], missing = [];
+  LIST_JOBS[jid] = { id: jid, kind: 'list', title: name, total: items.length, added: 0, status: 'running', playlist_id: null, missing };
+  (async () => {
+    emit('job', { id: jid, status: 'running', kind: 'list', title: name, artwork: null, total: items.length, added: 0, found: 0 });
+    for (let i = 0; i < items.length; i++) {
+      await sleep(260);
+      if (i % 4 === 3) missing.push(items[i]);
+      else { const [id] = takeFromPool(1); const t = DB.tracks.get(id); t.title = items[i].title; t.artist = items[i].artist || t.artist; ids.push(id); DB.library.unshift(id); emit('track_added', { job: jid, playlist: null, track: tOut(t) }); }
+      emit('job', { id: jid, status: 'running', kind: 'list', title: name, artwork: ids[0] ? DB.tracks.get(ids[0]).artwork : null, total: items.length, added: i + 1, found: ids.length });
+    }
+    const p2 = pl('p' + (++seq), 'imported', name, 'Перенос по списку', ids[0] ? DB.tracks.get(ids[0]).artwork : C('aurora'), ids.slice());
+    DB.playlists.unshift(p2); Object.assign(LIST_JOBS[jid], { status: 'done', added: items.length, playlist_id: p2.id });
+    emit('job', { id: jid, status: 'done', kind: 'list', title: name, artwork: p2.artwork, total: items.length, added: items.length, found: ids.length, missing: missing.length, playlist: plOut(p2) });
+  })();
+  return { ok: true, count: items.length, total: items.length, sample: items.slice(0, 5) };
+}
+function ewaDemo(text) {
+  const t = String(text || '').toLowerCase();
+  if (/яндекс/.test(t)) return { text: 'Из Яндекс Музыки переносим честно: скопируй список своих треков (на music.yandex.ru — «Мне нравится», прокрути до конца, выдели и скопируй) или загрузи файл — я найду те же песни на SoundCloud.', tracks: [], actions: [{ open: 'yandex' }] };
+  if (/парн|дуэт|вдво/.test(t)) return { text: 'Парный плейлист — общий плейлист на двоих: открой Топ, нажми на человека и пригласи. После принятия вы оба добавляете треки, а ✦ подкинет общие вкусы.', tracks: [], actions: [{ open: 'leaders' }] };
+  const res = [...DB.tracks.values()].filter((x) => !DB.library.includes(x.id)).slice(0, 3);
+  return { text: t.includes('вечер') ? 'Вечером зайдёт что-то тёплое и неспешное — вот пара треков с мягким синтом и воздухом 🌙' : 'Держи подборку под это настроение — жми ▶, чтобы послушать, или +, чтобы забрать в медиатеку ✨', tracks: res.map(tOut), actions: [] };
+}
+
 function stats() {
   const ts = DB.library.map((x) => DB.tracks.get(x));
-  return { tracks: ts.length, hours: +(ts.reduce((s, t) => s + t.duration, 0) / 3600).toFixed(1), streak: 12,
+  return { listened_min: Math.round(listenedSec / 60), rank: meHidden ? null : 3,
+    tracks: ts.length, hours: +(ts.reduce((s, t) => s + t.duration, 0) / 3600).toFixed(1), streak: 12,
     week: [1, 1, 0, 1, 1, 1, 1], playlists: DB.playlists.length, listens: 148, top_genres: ['Post-Punk', 'Synthwave', 'Ambient'] };
 }
 
@@ -194,9 +251,47 @@ async function handle(method, path, body = {}) {
   const fail = (msg) => { throw new Error(msg); };
 
   if (p[0] === 'bootstrap') {
-    return { user: { id: 1, first_name: 'Алекс', username: 'alex' }, stats: stats(),
+    return { user: { id: 1, first_name: 'Алекс', username: 'alex', status: person(1).status, admin: true }, stats: stats(),
       tracks: DB.library.map((x) => tOut(DB.tracks.get(x))), playlists: DB.playlists.map(plOut), mixtapes: DB.mixtapes.map((m) => mxOut(m)), jobs: [],
-      config: { bot: 'VibeCloudBot', app_link: 'https://t.me/VibeCloudBot/app', storage: true, lite: true, direct: true } };
+      duos: DB.duos.map((d) => duoOut(d)), events_token: 'demo',
+      config: { bot: 'VibeCloudBot', app_link: 'https://t.me/VibeCloudBot/app', storage: true, lite: true, direct: true, ai: true, list_max: 1500 } };
+  }
+  if (p[0] === 'listen') { listenedSec += +body.seconds || 0; return { ok: true }; }
+  if (p[0] === 'import' && p[1] === 'list' && p[2] === 'preview') { const it = demoParse(body.text); return { count: it.length, sample: it.slice(0, 5) }; }
+  if (p[0] === 'import' && p[1] === 'list') { if (!demoParse(body.text).length) fail('Не нашёл треков'); return runList(body.text, body.title); }
+  if (p[0] === 'job') { const j = LIST_JOBS[p[1]]; if (!j) fail('Не найдено'); return j; }
+  if (p[0] === 'ewa') { await sleep(700); return ewaDemo(body.text); }
+  if (p[0] === 'leaders') {
+    const period = u.searchParams.get('period') || 'week', k = { week: 1, month: 3.6, all: 11 }[period];
+    const users = PEOPLE.filter((x) => !(x.id === 1 && meHidden)).map((x) => pOut(x, k)).sort((a, b) => b.minutes - a.minutes);
+    return { period, users, me: { ...pOut(person(1), k), rank: meHidden ? null : users.findIndex((x) => x.id === 1) + 1, hidden: meHidden }, admin: true };
+  }
+  if (p[0] === 'me' && p[1] === 'hidden') { meHidden = !!body.hidden; return { ok: true, hidden: meHidden }; }
+  if (p[0] === 'admin') { const x = person(+body.user_id); if (!x) fail('Не найден'); x.status = body.status || null; return { ok: true, status: x.status }; }
+  if (p[0] === 'user') {
+    const x = person(+p[1]); if (!x) fail('Не найден');
+    const duo = DB.duos.find((d) => [d.a, d.b].includes(x.id) && [d.a, d.b].includes(1) && x.id !== 1);
+    return { ...pOut(x), week_minutes: x.min, total_minutes: x.min * 11, rank: PEOPLE.slice().sort((a, b) => b.min - a.min).indexOf(x) + 1,
+      tracks: 120 + x.id * 7, top_genres: x.genres, match: x.id === 1 ? null : 20 + ((x.id * 17) % 60), duo: duo ? duoOut(duo) : null, me: x.id === 1 };
+  }
+  if (p[0] === 'duos') {
+    if (method === 'POST') {
+      const x = person(+body.user_id); if (!x) fail('Не найден');
+      if (DB.duos.some((d) => d.state === 'pending' && d.b === x.id)) fail('Приглашение уже отправлено — ждём ответа');
+      const d = { id: 'd' + (++seq), title: body.title || `Алекс + ${x.name}`, a: 1, b: x.id, state: 'pending', ids: [], by: {} };
+      DB.duos.unshift(d); return duoOut(d);
+    }
+    return { duos: DB.duos.map((d) => duoOut(d)) };
+  }
+  if (p[0] === 'duo') {
+    const d = DB.duos.find((x) => x.id === p[1]); if (!d) fail('Парный плейлист не найден');
+    if (method === 'DELETE' && p[2] === 'track') { d.ids = d.ids.filter((x) => x !== +p[3]); return { ok: true }; }
+    if (method === 'DELETE') { DB.duos = DB.duos.filter((x) => x !== d); return { ok: true }; }
+    if (p[2] === 'accept') { d.state = 'active'; d.ids = [102, 106, 115]; d.ids.forEach((x) => { d.by[x] = 1; }); return duoOut(d); }
+    if (p[2] === 'decline') { DB.duos = DB.duos.filter((x) => x !== d); return { id: d.id, deleted: true }; }
+    if (p[2] === 'add') { const before = d.ids.length; (body.track_ids || []).forEach((x) => { if (!d.ids.includes(+x)) { d.ids.push(+x); d.by[+x] = 1; } }); return { ok: true, added: d.ids.length - before }; }
+    if (p[2] === 'fill') { const before = d.ids.length; [104, 111, 107].forEach((x) => { if (!d.ids.includes(x)) { d.ids.push(x); d.by[x] = 2; } }); return { ok: true, added: d.ids.length - before }; }
+    return duoOut(d, true);
   }
   if (p[0] === 'import' && p[1] === 'inspect') {
     const r = parse(body.url); if (!r) fail('Это не ссылка SoundCloud');

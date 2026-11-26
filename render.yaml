@@ -13,6 +13,14 @@ services:
         sync: false
       - key: STORAGE_CHAT_ID
         sync: false
+      # твой Telegram ID (узнать — команда /myid у бота): выдавать статусы в топе
+      - key: ADMIN_IDS
+        sync: false
+      # Ewa: бесплатный ключ groq/gemini/openrouter (можно оставить пустым — будет FAQ + поиск)
+      - key: AI_PROVIDER
+        value: groq
+      - key: AI_API_KEY
+        sync: false
       - key: WEBAPP_SHORT_NAME
         value: app
       - key: LITE_MODE
@@ -21,10 +29,11 @@ services:
         value: "1"
       - key: CACHE_MAX_GB
         value: "0.5"
-      # Диск на бесплатном Render стирается при перезапуске. Раз в 10 минут (если были изменения)
-      # копия базы уходит в ваш приватный канал STORAGE_CHAT_ID и восстанавливается при старте.
+      # Диск на бесплатном Render стирается при перезапуске. Раз в 2 минуты (если были изменения)
+      # копия базы уходит в ваш приватный канал STORAGE_CHAT_ID и восстанавливается при старте;
+      # при редеплое новый экземпляр ждёт финальную копию от старого — изменения не теряются.
       - key: DB_BACKUP_MIN
-        value: "10"
+        value: "2"
       # Самопинг раз в 10 минут, чтобы бесплатный сервис не засыпал (0 — выключить)
       - key: KEEPALIVE_MIN
         value: "10"

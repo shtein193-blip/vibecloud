@@ -12,6 +12,8 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import aiohttp
 
+from .tasks import TTLCache
+
 log = logging.getLogger(__name__)
 
 API = "https://api-v2.soundcloud.com"
@@ -108,6 +110,22 @@ def track_meta(t: dict) -> dict:
     }
 
 
+SLIM_KEYS = ("id", "kind", "title", "artwork_url", "duration", "full_duration", "permalink_url", "waveform_url",
+             "genre", "playback_count", "policy", "streamable")
+
+
+def _slim(t: dict) -> dict:
+    """Only what track_meta() and list matching need — search results are cached in RAM."""
+    out = {k: t.get(k) for k in SLIM_KEYS if k in t}
+    u, pub = t.get("user") or {}, t.get("publisher_metadata") or {}
+    out["user"] = {"username": u.get("username"), "avatar_url": u.get("avatar_url")}
+    if pub.get("artist"):
+        out["publisher_metadata"] = {"artist": pub["artist"]}
+    tcs = (t.get("media") or {}).get("transcodings") or []
+    out["media"] = {"transcodings": [{"format": {"protocol": (tc.get("format") or {}).get("protocol")}} for tc in tcs]}
+    return out
+
+
 def _url_expiry(url: str) -> int:
     """CloudFront signed url: the playlist itself is valid only a few minutes (Policy), segments ~2 h."""
     q = parse_qs(urlsplit(url).query)
@@ -141,6 +159,8 @@ class SoundCloud:
         self._lock = asyncio.Lock()
         self.session: aiohttp.ClientSession | None = None
         self._streams: dict[int, dict] = {}
+        # repeated searches (Ewa, list import, inline mode) — slim objects, ~1 KB per track
+        self._search_cache: TTLCache = TTLCache(maxsize=400, ttl=900)
 
     async def start(self) -> None:
         self.session = aiohttp.ClientSession(
@@ -258,8 +278,14 @@ class SoundCloud:
                                     lambda x: x if x.get("kind") == "playlist" else None)
 
     async def search(self, q: str, limit: int = 20) -> list[dict]:
+        key = (q.strip().lower(), limit)
+        hit = self._search_cache.get(key)
+        if hit is not None:
+            return hit
         data = await self.api("/search/tracks", q=q, limit=limit)
-        return [t for t in data.get("collection", []) if t.get("kind") == "track"]
+        out = [_slim(t) for t in data.get("collection", []) if t.get("kind") == "track"]
+        self._search_cache[key] = out
+        return out
 
     async def stream_url(self, tid: int) -> dict | None:
         """Signed CDN url the Mini App can play directly (no audio bytes pass through our server).

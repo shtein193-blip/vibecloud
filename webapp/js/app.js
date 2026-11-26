@@ -76,18 +76,33 @@ const I = {
   x: ic('<path d="M6 6l12 12M18 6 6 18"/>'),
   cloud: ic('<path d="M7 18.5h10.5a4 4 0 0 0 .6-7.95A6 6 0 0 0 6.5 9.5 4.5 4.5 0 0 0 7 18.5z"/>'),
   alert: ic('<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v5.5M12 16.2v.3"/>'),
+  trophy: ic('<path d="M8 4.5h8v5a4 4 0 0 1-8 0z"/><path d="M8 6.5H5.2a2.7 2.7 0 0 0 2.9 3.4M16 6.5h2.8a2.7 2.7 0 0 1-2.9 3.4"/><path d="M12 13.5v3.5M8.5 20h7M9.5 17h5"/>'),
+  spark: ic('<path d="M12 3.5c.6 4.3 3.3 7.1 7.5 7.6-4.2.6-6.9 3.3-7.5 7.6-.6-4.3-3.3-7-7.5-7.6 4.2-.5 6.9-3.3 7.5-7.6z"/><path d="M19 3.5v3M17.5 5h3"/>'),
+  duo: ic('<circle cx="8.5" cy="8.5" r="3"/><circle cx="15.5" cy="8.5" r="3"/><path d="M3.5 19a5 5 0 0 1 10 0M10.5 19a5 5 0 0 1 10 0"/>'),
+  list: ic('<path d="M9 6.5h11M9 12h11M9 17.5h11"/><circle cx="4.7" cy="6.5" r="1" fill="currentColor"/><circle cx="4.7" cy="12" r="1" fill="currentColor"/><circle cx="4.7" cy="17.5" r="1" fill="currentColor"/>'),
+  file: ic('<path d="M7 3.5h7l4.5 4.5v11A1.5 1.5 0 0 1 17 20.5H7A1.5 1.5 0 0 1 5.5 19V5A1.5 1.5 0 0 1 7 3.5z"/><path d="M13.5 3.5V8.5h5"/>'),
+  edit: ic('<path d="M4.5 19.5h4l10-10a2.8 2.8 0 0 0-4-4l-10 10z"/><path d="m13.5 6.5 4 4"/>'),
+  arrowUp: ic('<path d="M12 19V5"/><path d="m6 11 6-6 6 6"/>'),
 };
 
 /* ------------------------------------------------------------------ api */
 const API = {
-  async req(method, path, body) {
+  async req(method, path, body, tries = 0) {
     if (DEMO) return window.VCDemo.handle(method, path, body);
-    const r = await fetch(path, {
-      method,
-      headers: { Authorization: 'tma ' + tg.initData, 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : undefined,
-    });
+    let r;
+    try {
+      r = await fetch(path, {
+        method,
+        headers: { Authorization: 'tma ' + tg.initData, 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    } catch (_) {
+      if (tries < 2) { await sleep(1200 * (tries + 1)); return API.req(method, path, body, tries + 1); }
+      throw new Error('Нет связи с сервером');
+    }
     const data = await r.json().catch(() => ({}));
+    // the free server is waking up / restoring its database — wait a bit instead of failing
+    if (r.status === 503 && tries < 8) { await sleep(2500); return API.req(method, path, body, tries + 1); }
     if (!r.ok) throw new Error(data.error || `Ошибка ${r.status}`);
     return data;
   },
@@ -102,7 +117,8 @@ const S = {
   tracks: new Map(), order: [], playlists: [], mixtapes: [],
   transit: new Map(), // jobId -> {id,title,artwork,kind,status,total,ids:[]}
   view: 'home', filter: 'all', q: '', remote: [], remoteQ: '',
-  closers: [],
+  closers: [], duos: [], leaders: null, period: 'week',
+  ewa: { msgs: [], busy: false },
 };
 const T = (id) => S.tracks.get(+id);
 
@@ -114,12 +130,21 @@ function upsertTrack(t, { prepend = false } = {}) {
 }
 
 /* ------------------------------------------------------------------ render helpers */
-function coverHTML(t, cls = 'cover') {
-  const letter = esc((t && (t.title || '?')).trim().charAt(0).toUpperCase());
-  const img = t && t.artwork ? `<img src="${esc(t.artwork)}" alt="" loading="lazy" decoding="async" onerror="this.remove()">` : '';
-  return `<div class="${cls}"><div class="ph">${letter}</div>${img}<span class="eq"><i></i><i></i><i></i></span></div>`;
+/* SoundCloud serves every cover in several sizes: thumbnails don't need the 500px original */
+const art = (url, size = 300) => url ? String(url).replace(/-t500x500\./, size >= 500 ? '-t500x500.' : '-t300x300.') : '';
+const IMG_ERR = "this.onerror=null;this.remove()";
+const letterOf = (t) => esc(String((t && t.title) || '?').trim().charAt(0).toUpperCase() || '?');
+function coverHTML(t, cls = 'cover', size = 300) {
+  const img = t && t.artwork ? `<img src="${esc(art(t.artwork, size))}" alt="" loading="lazy" decoding="async" onerror="${IMG_ERR}">` : '';
+  return `<div class="${cls}"><div class="ph">${letterOf(t)}</div>${img}<span class="eq"><i></i><i></i><i></i></span></div>`;
 }
-const coverImgOnly = (src, cls = '') => src ? `<img class="${cls}" src="${esc(src)}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">` : `<div class="ph ${cls}"></div>`;
+// placeholder underneath, image on top: a broken/missing cover never leaves an empty hole or an alt text
+const coverImgOnly = (src, letter = '', size = 300) => `<div class="ph">${esc(letter)}</div>` +
+  (src ? `<img src="${esc(art(src, size))}" alt="" loading="lazy" decoding="async" onerror="${IMG_ERR}">` : '');
+function avaHTML(u, cls = 'ava') {
+  const name = (u && (u.name || u.first_name)) || '?';
+  return `<span class="${cls}">${esc(String(name).trim().charAt(0).toUpperCase())}${u && (u.photo || u.photo_url) ? `<img src="${esc(u.photo || u.photo_url)}" alt="" loading="lazy" onerror="${IMG_ERR}">` : ''}</span>`;
+}
 
 function stateHTML(t) {
   switch (t.status) {
@@ -169,17 +194,23 @@ function splitLetters(text) {
 
 const measureCtx = document.createElement('canvas').getContext('2d');
 const isRu = (t) => /[\u0400-\u04FF]/.test(String(t || ''));
-function fitGiant(text, width, maxSize, maxLines = 3, family = 'Anton') {
+function fitGiant(text, width, maxSize, maxLines = 3, family = 'Anton', minSize = 34) {
   const words = String(text).toUpperCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return maxSize;
   // Anton has no Cyrillic — Russian titles render in Fira Sans Extra Condensed, so measure with it
   const fira = isRu(text) || family !== 'Anton';
   measureCtx.font = fira ? '900 100px "Fira Sans Extra Condensed", Impact' : '400 100px Anton, Impact';
-  const longest = Math.max(...words.map((w) => measureCtx.measureText(w).width), 1);
-  let size = Math.min(maxSize, (width / longest) * 100 * 0.96);
-  const total = measureCtx.measureText(words.join(' ')).width * (size / 100);
-  const lines = Math.ceil(total / width);
-  if (lines > maxLines) size *= Math.sqrt(maxLines / lines);
-  return Math.max(40, Math.floor(size));
+  const ww = words.map((w) => measureCtx.measureText(w).width), space = measureCtx.measureText(' ').width;
+  const longest = Math.max(...ww, 1);
+  let size = Math.min(maxSize, (width / longest) * 100 * 0.95);
+  // simulate the browser's greedy line wrapping and shrink until the title fits into maxLines
+  const linesAt = (sz) => {
+    const k = sz / 100; let lines = 1, cur = 0;
+    ww.forEach((w) => { const add = (cur ? space : 0) + w; if (cur && (cur + add) * k > width) { lines++; cur = w; } else cur += add; });
+    return lines;
+  };
+  while (size > minSize && linesAt(size) > maxLines) size *= 0.94;
+  return Math.max(minSize, Math.floor(size));
 }
 const shortTitle = (s, n = 26) => {
   s = String(s || '').replace(/\s*[\[(].*?[\])]\s*/g, ' ').replace(/\s+/g, ' ').trim();
@@ -213,7 +244,7 @@ function toast(text, kind = 'ok') {
 }
 
 /* ------------------------------------------------------------------ views */
-const VIEWS = ['home', 'library', 'import', 'mixtapes'];
+const VIEWS = ['home', 'library', 'import', 'leaders', 'mixtapes'];
 function go(view, { force = false } = {}) {
   if (S.view === view && !force) { window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
   S.view = view;
@@ -227,7 +258,7 @@ function go(view, { force = false } = {}) {
   haptic('select');
 }
 function render(view = S.view) {
-  ({ home: renderHome, library: renderLibrary, import: renderImport, mixtapes: renderMixtapes })[view]();
+  ({ home: renderHome, library: renderLibrary, import: renderImport, leaders: renderLeaders, mixtapes: renderMixtapes })[view]();
 }
 let renderQueued = null;
 function scheduleRender() {
@@ -250,12 +281,22 @@ function transitHTML() {
     const lite = LITE();
     // LITE: nothing is downloaded in advance — a track has "arrived" as soon as it is in the library
     const dots = ts.slice(0, 60).map((t) => `<i class="${t.status === 'ready' || (lite && t.status !== 'unavailable' && t.status !== 'error') ? 'on' : t.status === 'downloading' ? 'half' : ''}"></i>`).join('');
+    if (j.kind === 'list') {
+      const sub2 = j.status === 'running' ? `Ищу на SoundCloud · ${j.added || 0} из ${j.total} · найдено ${j.found || 0}` : `✓ Найдено ${j.found || 0} из ${j.total}`;
+      const pct = j.total ? Math.round(((j.added || 0) / j.total) * 100) : 0;
+      return `<div class="job" data-job="${esc(j.id)}" data-act="list-report" role="button" tabindex="0">
+        ${j.artwork ? `<img src="${esc(art(j.artwork))}" alt="" onerror="${IMG_ERR}">` : `<div class="ph">${I.list}</div>`}
+        <div class="job-main"><b>${esc(j.title || 'Список')}</b><span>${sub2}</span>
+          <div class="dotbar">${Array.from({ length: 30 }, (_, k) => `<i class="${k < pct * 0.3 ? 'on' : ''}"></i>`).join('')}</div></div>
+        <span class="job-count">${j.found || 0}<small style="font-size:14px;opacity:.6">/${j.total}</small></span>
+      </div>`;
+    }
     const sub = lite
       ? (j.status === 'running' ? (j.total ? `Переношу · ${ts.length} из ${total}` : 'Читаю SoundCloud…') : `✓ ${tracksWord(total)} · слушай сразу`)
       : j.status === 'running' ? (j.total ? `Переношу · офлайн ${ready} из ${total}` : 'Читаю SoundCloud…')
         : ready >= total ? `✓ ${tracksWord(total)} · всё офлайн` : `${tracksWord(total)} в медиатеке · офлайн ${ready}`;
     return `<div class="job" data-job="${esc(j.id)}">
-      ${j.artwork ? `<img src="${esc(j.artwork)}" alt="">` : '<div class="ph"></div>'}
+      ${j.artwork ? `<img src="${esc(art(j.artwork))}" alt="" onerror="${IMG_ERR}">` : `<div class="ph">${j.kind === 'list' ? I.list : '♪'}</div>`}
       <div class="job-main"><b>${esc(j.title || 'Перенос')}</b><span>${sub}</span><div class="dotbar">${dots}</div></div>
       <span class="job-count">${ts.length}<small style="font-size:14px;opacity:.6">/${total || '…'}</small></span>
     </div>`;
@@ -269,12 +310,12 @@ function renderHome() {
   const avatar = u.photo_url ? `<img src="${esc(u.photo_url)}" alt="">` : esc(name.charAt(0));
   const today = new Date().getDay();
   const week = (st.week || []).map((on, i) => `<span class="${on ? 'on' : ''}${i === 6 ? ' today' : ''}"></span>`).join('');
-  $('[data-view="home"]').innerHTML = `
+  $('section[data-view="home"]').innerHTML = `
     <header class="topbar">
       <div class="avatar">${avatar}</div>
       <div class="hello"><small>${greeting()},</small><b>${esc(name)}</b></div>
       <button class="icon-btn" data-act="search" aria-label="Поиск">${I.search}</button>
-      <button class="icon-btn" data-act="go-mixtapes" aria-label="Микстейпы">${I.gift}</button>
+      <button class="icon-btn ewa-btn" data-act="ewa" aria-label="Спросить Ewa">${I.spark}</button>
     </header>
 
     <section class="hero" aria-label="Перенос из SoundCloud">
@@ -296,6 +337,11 @@ function renderHome() {
 
     <section class="transit" id="transit-home">${transitHTML()}</section>
 
+    <div class="quick">
+      <button class="qcard ewa" data-act="ewa"><span class="orb">E</span><div><b>Спроси Ewa</b><span>Подберёт музыку под настроение</span></div></button>
+      <button class="qcard top" data-act="go-leaders"><span class="big" id="home-rank">${st.rank ? '#' + st.rank : '—'}</span><div><b>Топ недели</b><span>${st.rank ? 'Твоё место среди слушателей' : 'Слушай — и попадёшь в топ'}</span></div></button>
+    </div>
+
     <section class="section" aria-label="Статистика">
       <div class="stats">
         <div class="tile big"><span class="lbl">Перенесено</span><b class="num" data-count="${st.tracks || 0}">0</b><span class="dotgrid"></span>
@@ -310,15 +356,16 @@ function renderHome() {
       <div id="home-recent">${recentHTML(recent)}</div>
     </section>
     <div id="home-pl">${homePlaylistsHTML()}</div>`;
-  $$('[data-count]', $('[data-view="home"]')).forEach((el) => countUp(el, +el.dataset.count, +(el.dataset.dec || 0)));
+  $$('[data-count]', $('section[data-view="home"]')).forEach((el) => countUp(el, +el.dataset.count, +(el.dataset.dec || 0)));
   recent.forEach((t) => delete t._new);
 }
 
-const musicStat = (st) => { const h = (st && st.hours) || 0; return h < 10 ? { label: 'Минут музыки', value: Math.round(h * 60) } : { label: 'Часов музыки', value: Math.round(h) }; };
+// real listening time (what the leaderboard counts), not the length of the library
+const musicStat = (st) => { const m = (st && st.listened_min) || 0; return m < 600 ? { label: 'Минут послушано', value: m } : { label: 'Часов послушано', value: Math.round(m / 60) }; };
 function recentHTML(recent) {
   return recent.length ? `<div class="rail" data-queue="recent">${recent.map((t, i) => `
     <div class="card${t._new ? ' arrive' : ''}" style="--i:${t._new ? 0 : i}" data-tid="${t.id}" data-act="play" role="button" tabindex="0">
-      ${t.artwork ? `<img src="${esc(t.artwork)}" alt="" loading="lazy">` : '<div class="ph"></div>'}
+      ${coverImgOnly(t.artwork, (t.title || '?').charAt(0))}
       <span class="pill-top${t.status === 'ready' ? ' ready' : ''}">${pillText(t)}</span>
       <div class="card-txt"><b>${esc(shortTitle(t.title, 30))}</b><span>${esc(t.artist)}</span></div>
     </div>`).join('')}</div>`
@@ -332,7 +379,7 @@ function homePlaylistsHTML() {
 }
 /* light refresh while tracks stream in: no full re-render, numbers roll from the current value */
 function refreshHome() {
-  const root = $('[data-view="home"]'); if (!root || !$('#home-recent', root)) return renderHome();
+  const root = $('section[data-view="home"]'); if (!root || !$('#home-recent', root)) return renderHome();
   const recent = S.order.slice(0, 12).map(T).filter(Boolean);
   const rail = $('.rail', root), sx = rail ? rail.scrollLeft : 0;
   $('#home-recent', root).innerHTML = recentHTML(recent);
@@ -351,8 +398,8 @@ function refreshHome() {
 
 function plRowHTML(p) {
   return `<div class="row" data-pid="${esc(p.id)}" data-act="open-pl" role="button" tabindex="0">
-    <div class="cover">${coverImgOnly(p.artwork)}</div>
-    <div class="row-main"><b>${esc(p.title)}</b><span>${p.kind === 'mixtape' ? '🎁 ' : ''}${esc(p.artist || '')} · ${tracksWord(p.track_count)}</span></div>
+    <div class="cover">${coverImgOnly(p.artwork, (p.title || '?').charAt(0))}</div>
+    <div class="row-main"><b>${esc(p.title)}</b><span>${p.kind === 'mixtape' ? '🎁 ' : p.kind === 'imported' ? '🟡 ' : ''}${esc(p.artist || '')} · ${tracksWord(p.track_count)}</span></div>
     ${p.watch ? `<span class="row-state" title="Слежу за обновлениями">${I.bell}</span>` : ''}
     <button class="round" data-act="play-pl" aria-label="Слушать">${I.play}</button>
   </div>`;
@@ -368,14 +415,14 @@ function filteredTracks() {
 }
 
 function renderLibrary({ keepSearch = false } = {}) {
-  const root = $('[data-view="library"]');
+  const root = $('section[data-view="library"]');
   const all = S.order.map(T).filter(Boolean);
   const counts = { all: all.length, liked: all.filter((t) => t.liked).length, offline: all.filter((t) => t.status === 'ready').length, playlists: S.playlists.length };
   const chip = (id, label) => `<button class="chip${S.filter === id ? ' on' : ''}" data-act="filter" data-f="${id}">${label}<span class="n">${counts[id]}</span></button>`;
   const body = S.filter === 'playlists'
     ? (S.playlists.length ? `<div class="grid2">${S.playlists.map((p, i) => `
         <div class="pl-card arrive" style="--i:${i}" data-pid="${esc(p.id)}" data-act="open-pl" role="button" tabindex="0">
-          ${coverImgOnly(p.artwork)}${p.watch ? `<span class="bell">${I.bell}</span>` : ''}
+          ${coverImgOnly(p.artwork, (p.title || '?').charAt(0))}${p.watch ? `<span class="bell">${I.bell}</span>` : ''}
           <div class="txt"><b>${esc(shortTitle(p.title, 34))}</b><span>${tracksWord(p.track_count)} · ${fmtLong(p.duration)}</span></div>
         </div>`).join('')}</div>` : '<div class="empty"><b>Нет плейлистов</b>Перенеси плейлист, альбом или лайки — они появятся тут.</div>')
     : libraryListHTML();
@@ -401,7 +448,7 @@ function libraryListHTML() {
 }
 
 function renderImport() {
-  $('[data-view="import"]').innerHTML = `
+  $('section[data-view="import"]').innerHTML = `
     <div class="punk">
       <h1 class="punk-word">Drop</h1>
       <div class="punk-cols">
@@ -421,6 +468,7 @@ function renderImport() {
     </form>
     <div id="preview-slot"></div>
     <section class="transit" id="transit-import" style="${S.transit.size ? '' : 'display:none'}">${transitHTML()}</section>
+    ${yandexHTML()}
     <section class="section">
       <div class="section-head"><h2>Самые быстрые способы</h2></div>
       <div class="ways">
@@ -428,6 +476,7 @@ function renderImport() {
         <div class="way"><span class="n">02</span><div><b>Профиль целиком</b><span>Ссылка на профиль — и выбираешь: все лайки, треки артиста или все плейлисты разом.</span></div></div>
         <div class="way"><span class="n">03</span><div><b>Отправить другу из любого чата</b><span>Набери <code>@${esc(S.config.bot || 'VibeCloudBot')} название</code> в любом чате — трек уйдёт аудиофайлом.</span></div></div>
         <div class="way"><span class="n">04</span><div><b>Следить за плейлистом</b><span>Включи 🔔 у плейлиста — новые треки сами появятся в медиатеке, а бот напишет.</span></div></div>
+        <div class="way"><span class="n">05</span><div><b>Список файлом в бота</b><span>Пришли боту .txt, .csv или .json со списком треков — он найдёт их на SoundCloud и пришлёт отчёт.</span></div></div>
       </div>
     </section>`;
 }
@@ -440,7 +489,7 @@ function mixtapeCardHTML(m, i = 0) {
     <h2 class="mx-title" style="font-size:${size}px">${esc(m.title)}</h2>
     ${m.note ? `<p style="margin:10px 0 0;font-weight:700;font-size:14px;opacity:.85">«${esc(m.note)}»</p>` : ''}
     <div class="mx-foot">
-      <div class="stack">${(m.covers || []).slice(0, 4).map((c) => `<img src="${esc(c)}" alt="">`).join('')}</div>
+      <div class="stack">${(m.covers || []).slice(0, 4).map((c) => `<img src="${esc(art(c))}" alt="" loading="lazy" onerror="${IMG_ERR}">`).join('')}</div>
       <span class="sp"></span>
       <button class="btn ${m.theme === 'lime' ? 'btn-lime' : m.theme === 'red' ? 'btn-paper' : 'btn-ink'}" data-act="share-mx">${I.send}Отправить</button>
     </div>
@@ -448,7 +497,7 @@ function mixtapeCardHTML(m, i = 0) {
 }
 
 function renderMixtapes() {
-  $('[data-view="mixtapes"]').innerHTML = `
+  $('section[data-view="mixtapes"]').innerHTML = `
     <div class="page-title"><h1>Микс<br>тейпы</h1><span class="count">${String(S.mixtapes.length).padStart(2, '0')}</span></div>
     <p class="page-sub">Собери подборку и отправь другу. Он откроет постер и заберёт все треки себе в один тап.</p>
     <button class="btn btn-lime btn-block" style="margin-top:20px;min-height:56px" data-act="new-mx">${I.plus}Собрать микстейп</button>
@@ -468,7 +517,7 @@ function initAudio() {
   const a = P.audio;
   a.addEventListener('timeupdate', onTime);
   a.addEventListener('playing', () => { P.playing = true; setLoading(false); syncPlayState(); });
-  a.addEventListener('pause', () => { P.playing = false; syncPlayState(); });
+  a.addEventListener('pause', () => { P.playing = false; syncPlayState(); flushListen(); });
   a.addEventListener('waiting', () => setLoading(true));
   a.addEventListener('ended', () => (P.repeat === 'one' ? (a.currentTime = 0, a.play()) : next(true)));
   a.addEventListener('error', () => {
@@ -598,12 +647,15 @@ function playIndex(i, dir = 'right') {
   if ($('#player').classList.contains('on')) renderPlayer(prevT && prevT.id !== t.id ? dir : null);
   highlightPlaying();
   loadWave(t);
-  tintFrom(t.artwork);
+  tintFrom(art(t.artwork, 300));
+  flushListen();
   if ('mediaSession' in navigator) {
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: t.title, artist: t.artist, album: 'VibeCloud',
-      artwork: t.artwork ? [{ src: t.artwork, sizes: '500x500', type: 'image/jpeg' }] : [],
-    });
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: t.title, artist: t.artist, album: 'VibeCloud',
+        artwork: t.artwork ? [{ src: art(t.artwork, 500), sizes: '500x500', type: 'image/jpeg' }] : [],
+      });
+    } catch (_) { /* old webview */ }
   }
   // warm up the next track: just its CDN url (LITE) or the MP3 on the server
   const n = T(P.queue[i + 1]);
@@ -636,8 +688,25 @@ function highlightPlaying() {
   if (!t) return;
   $$(`.row[data-tid="${t.id}"]`).forEach((r) => { r.classList.add('playing'); r.classList.toggle('paused', !P.playing); });
 }
+/* listening time for the leaderboard: only seconds that really played (no seeks), sent in ~1 min beats */
+const L = { acc: 0, last: null };
+function flushListen(keepalive = false) {
+  L.last = null;
+  const sec = Math.round(L.acc);
+  if (sec < 1) return;
+  L.acc = 0;
+  if (S.stats) S.stats.listened_min = (S.stats.listened_min || 0) + sec / 60;
+  if (DEMO) { window.VCDemo.handle('POST', '/api/listen', { seconds: sec }); return; }
+  fetch('/api/listen', { method: 'POST', keepalive, headers: { Authorization: 'tma ' + tg.initData, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ seconds: sec }) }).catch(() => { L.acc += sec; });
+}
 function onTime() {
   const a = P.audio, d = a.duration || (P.current() && P.current().duration) || 0;
+  if (P.playing && !a.paused) {
+    if (L.last != null) { const dt = a.currentTime - L.last; if (dt > 0 && dt < 2.5) L.acc += dt; }
+    L.last = a.currentTime;
+    if (L.acc >= 60) flushListen();
+  }
   const p = d ? a.currentTime / d : 0;
   $('#mini').style.setProperty('--p', (p * 100).toFixed(2));
   if ($('#player').classList.contains('on')) {
@@ -717,8 +786,8 @@ function renderPlayer(dir) {
   const t = P.current(); if (!t) return;
   const pl = $('#player');
   const width = Math.min(innerWidth, 520) - 32;
-  const title = shortTitle(t.title, 28);
-  const size = fitGiant(title, width, 150, 3);
+  const title = shortTitle(t.title, 30);
+  const size = fitGiant(title, width - 8, 112, 2);
   const src = P.source ? esc(P.source) : 'Медиатека';
   if (!$('.pl-stage', pl) || !dir) {
     pl.innerHTML = `
@@ -730,7 +799,7 @@ function renderPlayer(dir) {
       </header>
       <div class="pl-stage">
         <h1 class="pl-giant split" aria-hidden="true"></h1>
-        <div class="pl-cover"></div>
+        <div class="pl-art"><div class="pl-cover"></div></div>
       </div>
       <div class="pl-meta"><div class="t"><h2></h2><p></p></div>
         <button class="icon-btn like" data-act="like-current" aria-label="Лайк">${I.heart}</button></div>
@@ -757,8 +826,8 @@ function renderPlayer(dir) {
     giant.style.setProperty('--gsize', size + 'px');
     giant.classList.toggle('ru', isRu(title));
     giant.innerHTML = splitLetters(title);
-    cover.innerHTML = t.artwork ? `<img src="${esc(t.artwork)}" alt="">` : `<div class="ph" style="font-size:120px">${esc(t.title.charAt(0))}</div>`;
-    $('.pl-bg', pl).style.backgroundImage = t.artwork ? `url("${t.artwork}")` : 'none';
+    cover.innerHTML = coverImgOnly(t.artwork, (t.title || '?').charAt(0).toUpperCase(), 500);
+    $('.pl-bg', pl).style.backgroundImage = t.artwork ? `url("${art(t.artwork)}")` : 'none';
     $('.pl-meta h2', pl).textContent = t.title;
     $('.pl-meta p', pl).textContent = t.artist;
     $('.src', pl).textContent = P.source || 'Медиатека';
@@ -825,10 +894,10 @@ async function openPlaylist(pid) {
   let pl;
   try { pl = await API.get(`/api/playlist/${pid}`); } catch (e) { closeDetail(); return toast(e.message, 'err'); }
   pl.tracks.forEach((t) => upsertTrack(t));
-  const size = fitGiant(shortTitle(pl.title, 34), Math.min(innerWidth, 520) - 40, 110, 3);
+  const size = fitGiant(shortTitle(pl.title, 34), Math.min(innerWidth, 520) - 44, 104, 3);
   d.innerHTML = `
     <section class="d-hero">
-      <div class="bgimg" style="background-image:url('${esc(pl.artwork || '')}')"></div>
+      <div class="bgimg" style="background-image:url('${esc(art(pl.artwork, 500))}')"></div>
       <div class="pl-head"><button class="icon-btn" data-act="close-detail" aria-label="Назад">${I.back}</button><span style="flex:1"></span>
         ${pl.kind !== 'mixtape' ? `<button class="icon-btn" data-act="sync-pl" data-pid="${esc(pl.id)}" aria-label="Обновить">${I.sync}</button>` : ''}
         <button class="icon-btn" data-act="del-pl" data-pid="${esc(pl.id)}" aria-label="Удалить">${I.trash}</button></div>
@@ -869,7 +938,7 @@ async function openMixtape(code) {
         <div class="mx-meta"><span>Mixtape<br>by ${esc(m.owner || 'друг')}</span><span>${tracksWord(m.track_count)}<br>${fmtLong(m.duration)}</span></div>
         <h2 class="mx-title split" style="font-size:${size}px">${splitLetters(m.title)}</h2>
         ${m.note ? `<p style="margin:12px 0 0;font-weight:800;font-size:15px">«${esc(m.note)}»</p>` : ''}
-        <div class="mx-foot"><div class="stack">${(m.covers || []).map((c) => `<img src="${esc(c)}" alt="">`).join('')}</div></div>
+        <div class="mx-foot"><div class="stack">${(m.covers || []).map((c) => `<img src="${esc(art(c))}" alt="" onerror="${IMG_ERR}">`).join('')}</div></div>
       </article>
     </div>
     <div class="d-actions" style="margin-top:14px">
@@ -904,6 +973,7 @@ function trackSheet(t) {
     <button class="act" data-act="s-send" data-tid="${t.id}">${I.send}Отправить в чат<span class="hint">аудиофайлом</span></button>
     <button class="act" data-act="s-share" data-tid="${t.id}">${I.share}Поделиться с другом</button>
     <button class="act" data-act="s-mx" data-tid="${t.id}">${I.gift}Добавить в микстейп</button>
+    ${S.duos.some((d) => d.state === 'active') ? `<button class="act" data-act="s-duo" data-tid="${t.id}">${I.duo}В парный плейлист</button>` : ''}
     <button class="act" data-act="s-like" data-tid="${t.id}">${I.heart}${t.liked ? 'Убрать из лайков' : 'В лайки'}</button>
     ${t.permalink ? `<button class="act" data-act="s-sc" data-tid="${t.id}">${I.link}Открыть в SoundCloud</button>` : ''}
     ${inLib ? `<button class="act danger" data-act="s-del" data-tid="${t.id}">${I.trash}Убрать из медиатеки</button>` : ''}`);
@@ -1075,7 +1145,7 @@ const ACTIONS = {
   'send-current': () => P.current() && sendTrack(P.current()),
   'share-current': () => P.current() && shareTrack(P.current()),
   'mx-current': () => P.current() && mixtapeSheet([P.current().id]),
-  'open-pl': (el) => openPlaylist(el.closest('[data-pid]').dataset.pid),
+  'open-pl': (el) => { closeSheet(); openPlaylist(el.closest('[data-pid]').dataset.pid); },
   'play-pl': (el) => playPlaylist(el.closest('[data-pid]').dataset.pid),
   'shuffle-pl': (el) => playPlaylist(el.dataset.pid, true),
   'send-pl': async (el) => { try { const r = await API.post(`/api/playlist/${el.dataset.pid}/send`); toast(`Отправляю ${tracksWord(r.count)} в чат`); haptic('success'); } catch (e) { toast(e.message, 'err'); } },
@@ -1115,17 +1185,386 @@ const ACTIONS = {
   seek: () => {},
 };
 
+/* ------------------------------------------------------------------ Yandex Music / list import */
+function yandexHTML() {
+  const max = (S.config && S.config.list_max) || 1500;
+  return `<section class="ya" id="ya">
+    <div class="ya-head"><span class="ya-ic">${I.list}</span><div><b>Из Яндекс Музыки</b><span>Честно: по твоему списку треков — найдём те же песни на SoundCloud</span></div></div>
+    <form class="field" data-form="list">
+      <label class="sr" for="ya-text">Список треков</label>
+      <textarea id="ya-text" name="list" rows="4" placeholder="Вставь список: «Исполнитель — Название» по строке, или всё, что скопировал со страницы плейлиста" autocomplete="off"></textarea>
+      <div class="field-foot">
+        <button class="chip-mini" style="background:var(--glass-2);color:var(--text)" type="button" data-act="paste-ya">${I.clip}Вставить</button>
+        <label class="chip-mini chip-file" style="background:var(--glass-2);color:var(--text)">${I.file}Файл<input type="file" id="ya-file" accept=".txt,.csv,.tsv,.json,.m3u,.m3u8,text/*,application/json"></label>
+        <span class="detected" id="ya-detected">Жду список…</span>
+        <button class="btn btn-lime" type="submit">Найти</button>
+      </div>
+    </form>
+    <div class="ya-sample" id="ya-sample"></div>
+    <details class="howto"><summary>Как получить список своих треков ${I.chev}</summary>
+      <ol>
+        <li><b>С компьютера:</b> открой music.yandex.ru → «Коллекция» → «Мне нравится» (или любой плейлист), прокрути страницу до самого конца, выдели список мышкой и скопируй (Ctrl+C) — вставь сюда как есть.</li>
+        <li><b>Файлом:</b> если переносил плейлисты через сервисы экспорта, загрузи их .csv/.txt/.json — колонки «Artist» и «Track» распознаются сами.</li>
+        <li><b>Вручную:</b> строки вида «Исполнитель — Название».</li>
+        <li>До ${max} треков за раз. Мы не заходим в твой аккаунт Яндекса и ничего оттуда не скачиваем — только ищем публичные треки на SoundCloud.</li>
+      </ol>
+    </details>
+  </section>`;
+}
+let yaTimer;
+function yaDetect(text) {
+  const det = $('#ya-detected'), smp = $('#ya-sample'); if (!det) return;
+  clearTimeout(yaTimer);
+  if (!text.trim()) { det.textContent = 'Жду список…'; det.className = 'detected'; smp.innerHTML = ''; return; }
+  det.textContent = 'Читаю список…'; det.className = 'detected';
+  yaTimer = setTimeout(async () => {
+    try {
+      const r = await API.post('/api/import/list/preview', { text });
+      det.textContent = r.count ? `${tracksWord(r.count)} — найду на SoundCloud` : 'Не вижу треков — нужен «Исполнитель — Название»';
+      det.className = 'detected' + (r.count ? ' ok' : '');
+      smp.innerHTML = r.count ? 'Например: ' + r.sample.slice(0, 3).map((x) => `<i>${esc(x.artist ? x.artist + ' — ' : '')}${esc(x.title)}</i>`).join(', ') : '';
+    } catch (_) { /* offline */ }
+  }, 450);
+}
+async function startListImport(text, title) {
+  if (!text.trim()) return toast('Вставь список треков или выбери файл', 'err');
+  haptic('medium');
+  try {
+    const r = await API.post('/api/import/list', { text, title });
+    toast(`Ищу ${tracksWord(r.count)} на SoundCloud ✦`);
+    const ta = $('#ya-text'); if (ta) { ta.value = ''; yaDetect(''); }
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function listReport(jid) {
+  let j;
+  try { j = await API.get(`/api/job/${jid}`); } catch (e) { return toast(e.message, 'err'); }
+  const found = Math.max(0, (j.total || 0) - j.missing.length);
+  openSheet(`
+    <div class="sheet-head" style="border:0;padding-bottom:0"><h3>Перенос<br>по списку</h3></div>
+    <div class="report-num"><b>${found}</b><span>из ${j.total} найдено на SoundCloud</span></div>
+    ${j.playlist_id ? `<button class="btn btn-lime btn-block" style="margin:10px 0 6px" data-act="open-pl" data-pid="${esc(j.playlist_id)}">${I.play}Открыть плейлист «${esc(j.title)}»</button>` : ''}
+    ${j.missing.length ? `<label class="label">Не нашлось · ${j.missing.length}</label>
+      <p style="margin:0 0 6px;color:var(--mute);font-size:13.5px">Возможно, их нет на SoundCloud или они называются иначе — попробуй поиск.</p>
+      ${j.missing.slice(0, 300).map((m) => `<div class="miss-row"><div class="row-main"><b>${esc(m.title)}</b><span>${esc(m.artist || '—')}</span></div>
+        <button class="round" data-act="miss-search" data-q="${esc((m.artist ? m.artist + ' ' : '') + m.title)}" aria-label="Искать">${I.search}</button></div>`).join('')}`
+      : '<div class="empty" style="margin-top:12px"><b>Нашлось всё 🎉</b>Все треки уже в медиатеке.</div>'}`);
+}
+
+/* ------------------------------------------------------------------ leaderboard */
+const PERIODS = { week: 'Неделя', month: 'Месяц', all: 'Всё время' };
+const fmtMin = (m) => m >= 600 ? `${Math.round(m / 60)} ч` : `${m} мин`;
+async function loadLeaders(period = S.period) {
+  S.period = period;
+  try { S.leaders = await API.get(`/api/leaders?period=${period}`); } catch (e) { toast(e.message, 'err'); }
+  if (S.view === 'leaders') renderLeaders();
+}
+function renderLeaders() {
+  const root = $('section[data-view="leaders"]'), L2 = S.leaders;
+  if (!L2) { loadLeaders(); root.innerHTML = `<div class="page-title"><h1>Топ<br>слушателей</h1></div><div class="skeleton" style="height:96px;margin-top:18px"></div><div class="skeleton" style="height:320px;margin-top:12px"></div>`; return; }
+  const me = L2.me || {};
+  const medal = ['🥇', '🥈', '🥉'];
+  const rows = L2.users.map((u, i) => `<div class="row lb-row${u.id === me.id ? ' me' : ''}${i === 0 ? ' top1' : ''}" data-uid="${u.id}" data-act="user" role="button" tabindex="0">
+      <span class="rank${i < 3 ? ' m' : ''}">${i < 3 ? medal[i] : i + 1}</span>${avaHTML(u)}
+      <div class="row-main"><b>${esc(u.name)}</b>${u.status ? `<span class="status-pill">${esc(u.status)}</span>` : `<span>${u.id === me.id ? 'это ты' : 'слушатель'}</span>`}</div>
+      <span class="mins">${fmtMin(u.minutes)}<small>${PERIODS[L2.period].toLowerCase()}</small></span></div>`).join('');
+  root.innerHTML = `
+    <div class="page-title"><h1>Топ<br>слушателей</h1><span class="count">${String(L2.users.length).padStart(2, '0')}</span></div>
+    <div class="me-card">
+      <div class="rk">${me.rank ? me.rank : '—'}<small>место</small></div>
+      <div style="min-width:0"><b>${esc(me.name || 'Ты')}</b>${me.status ? `<span class="status-pill">${esc(me.status)}</span>` : ''}<div class="min">${fmtMin(me.minutes || 0)} · ${PERIODS[L2.period].toLowerCase()}</div></div>
+      <button class="switch${me.hidden ? '' : ' on'}" data-act="toggle-hidden" aria-label="Показывать меня в топе"><i></i>в топе</button>
+    </div>
+    <div class="chips">${Object.entries(PERIODS).map(([k, v]) => `<button class="chip${L2.period === k ? ' on' : ''}" data-act="period" data-p="${k}">${v}</button>`).join('')}</div>
+    <section class="section" style="margin-top:22px">
+      <div class="section-head"><h2>Парные плейлисты</h2><button class="link" data-act="duo-help">Как это?</button></div>
+      <div class="rail" id="duo-rail">${duoRailHTML()}</div>
+    </section>
+    <section class="section">
+      <div class="section-head"><h2>Рейтинг</h2>${L2.admin ? '<span class="eyebrow" style="color:var(--violet)">ты админ ✦</span>' : ''}</div>
+      <div class="list">${rows || '<div class="empty"><b>Пока пусто</b>Включай музыку — минуты прослушивания попадают в топ.</div>'}</div>
+    </section>`;
+}
+function duoRailHTML() {
+  const cards = S.duos.map((d) => `<div class="duo-card${d.state === 'pending' ? ' pending' : ''}" data-did="${esc(d.id)}" data-act="open-duo" role="button" tabindex="0">
+      ${d.artwork ? `<span class="bg" style="background-image:url('${esc(art(d.artwork))}')"></span>` : ''}
+      <div class="pair">${avaHTML(d.me)}${avaHTML(d.partner)}<span class="heart">♥</span></div>
+      <b>${esc(d.title)}</b>
+      <span>${d.state === 'pending' ? (d.incoming ? `${esc(d.partner.name)} зовёт тебя` : `Ждём ответа ${esc(d.partner.name)}`) : `${tracksWord(d.track_count)} · с ${esc(d.partner.name)}`}</span>
+      ${d.incoming ? `<div class="acts"><button class="btn btn-lime" data-act="duo-accept" data-did="${esc(d.id)}">Принять</button><button class="btn btn-glass" data-act="duo-decline" data-did="${esc(d.id)}">Нет</button></div>` : ''}
+    </div>`).join('');
+  return cards + `<button class="duo-card duo-new" data-act="duo-new"><div>${I.plus}<br><b style="font-size:14px">Новый парный</b><br><span>выбери человека из топа</span></div></button>`;
+}
+async function userSheet(id) {
+  let u;
+  try { u = await API.get(`/api/user/${id}`); } catch (e) { return toast(e.message, 'err'); }
+  const admin = S.leaders && S.leaders.admin;
+  const presets = ['👑 Легенда', '🔥 Меломан', '🎧 Диджей', '💎 VIP', '🌙 Ночной слушатель', '🚀 Первопроходец'];
+  openSheet(`
+    <div class="prof">${avaHTML(u, 'ava xl')}<h3>${esc(u.name)}</h3>${u.status ? `<span class="status-pill" style="font-size:13px;margin-top:8px">${esc(u.status)}</span>` : ''}</div>
+    <div class="prof-stats">
+      <div><b>${u.rank || '—'}</b><span>место за неделю</span></div>
+      <div><b>${fmtMin(u.week_minutes)}</b><span>за неделю</span></div>
+      <div><b>${u.me ? tracksWord(u.tracks).split(' ')[0] : (u.match ?? 0) + '%'}</b><span>${u.me ? 'треков' : 'совпадение вкусов'}</span></div>
+    </div>
+    ${u.top_genres && u.top_genres.length ? `<p style="margin:0 0 10px;color:var(--mute);font-size:14px;text-align:center">Слушает: ${u.top_genres.map(esc).join(' · ')}</p>` : ''}
+    ${!u.me ? (u.duo ? `<button class="act" data-act="open-duo" data-did="${esc(u.duo.id)}">${I.duo}Открыть парный плейлист<span class="hint">${esc(u.duo.title)}</span></button>`
+      : `<button class="act" data-act="duo-invite" data-uid="${u.id}" data-name="${esc(u.name)}">${I.duo}Создать парный плейлист<span class="hint">собирать музыку вдвоём</span></button>`) : ''}
+    ${admin ? `<label class="label" for="st-in">Статус ${u.me ? '(себе)' : ''}</label>
+      <div style="display:flex;gap:8px"><input class="input" id="st-in" maxlength="40" placeholder="Например: 🔥 Меломан" value="${esc(u.status || '')}" autocomplete="off">
+      <button class="btn btn-lime" data-act="set-status" data-uid="${u.id}">${I.check}</button></div>
+      <div class="presets">${presets.map((p) => `<button data-act="status-preset" data-v="${esc(p)}">${esc(p)}</button>`).join('')}${u.status ? `<button data-act="set-status" data-uid="${u.id}" data-clear="1" style="color:#ff7a6b">Снять</button>` : ''}</div>` : ''}`);
+}
+function duoInviteSheet(uid, name) {
+  openSheet(`
+    <div class="sheet-head" style="border:0;padding-bottom:0"><h3>Парный<br>плейлист</h3></div>
+    <p style="margin:10px 0 0;color:var(--mute)">${esc(name)} получит приглашение в боте. Когда примет — вы оба сможете добавлять треки, а начнётся всё с того, что есть у вас обоих.</p>
+    <label class="label" for="duo-title">Название</label>
+    <input class="input" id="duo-title" maxlength="50" placeholder="${esc((S.user && S.user.first_name) || 'Я')} + ${esc(name)}" autocomplete="off">
+    <div class="sticky-foot"><button class="btn btn-lime btn-block" style="min-height:56px" data-act="duo-send" data-uid="${uid}">${I.send}Пригласить</button></div>`);
+}
+function duoPickSheet() {
+  const users = (S.leaders && S.leaders.users || []).filter((u) => !S.leaders.me || u.id !== S.leaders.me.id);
+  openSheet(`
+    <div class="sheet-head" style="border:0;padding-bottom:0"><h3>С кем<br>собираем?</h3></div>
+    <p style="margin:8px 0 10px;color:var(--mute)">Выбери человека из топа слушателей.</p>
+    <div class="list">${users.map((u) => `<div class="row lb-row" data-act="duo-invite" data-uid="${u.id}" data-name="${esc(u.name)}" role="button" tabindex="0">${avaHTML(u)}
+      <div class="row-main"><b>${esc(u.name)}</b>${u.status ? `<span class="status-pill">${esc(u.status)}</span>` : `<span>${fmtMin(u.minutes)}</span>`}</div></div>`).join('')
+      || '<div class="empty"><b>В топе пока никого</b>Позови друзей в VibeCloud — и собирайте музыку вместе.</div>'}</div>`);
+}
+
+/* ------------------------------------------------------------------ duo detail */
+async function openDuo(did) {
+  const d0 = $('#detail');
+  d0.innerHTML = '<div style="padding:calc(var(--top) + 80px) 20px"><div class="skeleton" style="height:260px"></div></div>';
+  d0.classList.add('on'); pushCloser(closeDetail);
+  let d;
+  try { d = await API.get(`/api/duo/${did}`); } catch (e) { closeDetail(); return toast(e.message, 'err'); }
+  d.tracks.forEach((t) => { if (!S.tracks.has(t.id)) S.tracks.set(t.id, t); else Object.assign(S.tracks.get(t.id), { status: t.status }); });
+  const size = fitGiant(shortTitle(d.title, 34), Math.min(innerWidth, 520) - 44, 92, 3);
+  const pending = d.state === 'pending';
+  d0.innerHTML = `
+    <section class="d-hero duo">
+      <div class="pl-head"><button class="icon-btn" data-act="close-detail" aria-label="Назад">${I.back}</button><span style="flex:1"></span>
+        <button class="icon-btn" data-act="duo-del" data-did="${esc(d.id)}" aria-label="Удалить">${I.trash}</button></div>
+      <div class="pair" style="margin-top:auto">${avaHTML(d.me)}${avaHTML(d.partner)}<span class="heart" style="font-size:26px">♥</span></div>
+      <h1 class="split${isRu(d.title) ? ' ru' : ''}" style="--gsize:${size}px;margin-top:14px">${splitLetters(shortTitle(d.title, 34))}</h1>
+      <div class="sub">Ты и ${esc(d.partner.name)} · ${tracksWord(d.track_count)} · ${fmtLong(d.duration)}</div>
+      ${!pending ? `<div class="match">Совпадение вкусов <b>${d.match}%</b></div>` : ''}
+    </section>
+    ${pending ? `<div class="d-actions">${d.incoming
+      ? `<button class="btn btn-lime" data-act="duo-accept" data-did="${esc(d.id)}">${I.check}Принять</button><button class="btn btn-glass" data-act="duo-decline" data-did="${esc(d.id)}">Отклонить</button>`
+      : `<div class="empty" style="flex:1;padding:18px">Ждём, когда ${esc(d.partner.name)} примет приглашение 💌</div>`}</div>`
+    : `<div class="d-actions">
+      <button class="btn btn-lime" data-act="play-duo">${I.play}Слушать</button>
+      <button class="icon-btn" data-act="duo-add" data-did="${esc(d.id)}" aria-label="Добавить треки">${I.plus}</button>
+      <button class="icon-btn" data-act="duo-fill" data-did="${esc(d.id)}" aria-label="Общие вкусы">${I.spark}</button>
+    </div>`}
+    <div class="d-list"><div class="list" data-queue="duo:${esc(d.id)}" data-source="${esc(d.title)}">
+      ${d.tracks.length ? d.tracks.map((t, i) => duoRowHTML(t, i)).join('')
+        : `<div class="empty"><b>Пока пусто</b>${pending ? 'Треки появятся после принятия приглашения.' : 'Нажми ✦ — добавлю то, что любите вы оба, или + чтобы выбрать вручную.'}</div>`}</div></div>`;
+  d0.dataset.duo = d.id;
+  d0.scrollTop = 0;
+  highlightPlaying();
+}
+function duoRowHTML(t, i) {
+  const html = rowHTML(T(t.id) || t, { idx: i + 1, arrive: true, i: Math.min(i, 10) });
+  return html.replace(`· ${fmt(t.duration)}</span>`, `· ${fmt(t.duration)} · <span class="by">${esc(t.added_by_name)}</span></span>`);
+}
+function duoAddSheet(did) {
+  const sel = new Set();
+  const list = S.order.map(T).filter((t) => t && t.status !== 'unavailable');
+  openSheet(`
+    <div class="sheet-head" style="border:0;padding-bottom:0"><h3>Добавить<br>в парный</h3></div>
+    <label class="search" style="margin-top:12px"><span class="sr">Поиск</span>${I.search}<input id="duo-q" type="search" placeholder="Найти в медиатеке" autocomplete="off"></label>
+    <label class="label">Выбрано · <span id="duo-count">0</span></label>
+    <div id="duo-picks">${list.map((t) => `<div class="pick" data-pick="${t.id}" data-s="${esc((t.title + ' ' + t.artist).toLowerCase())}" role="checkbox" aria-checked="false" tabindex="0">
+      ${coverHTML(t)}<div class="row-main"><b>${esc(t.title)}</b><span>${esc(t.artist)}</span></div><span class="check">${I.check}</span></div>`).join('') || '<div class="empty">Медиатека пуста</div>'}</div>
+    <div class="sticky-foot"><button class="btn btn-lime btn-block" style="min-height:56px" id="duo-go">${I.plus}Добавить</button></div>`,
+  (panel) => {
+    panel.addEventListener('input', (e) => { if (e.target.id !== 'duo-q') return; const q = e.target.value.trim().toLowerCase(); $$('[data-pick]', panel).forEach((el) => { el.style.display = !q || el.dataset.s.includes(q) ? '' : 'none'; }); });
+    panel.addEventListener('click', async (e) => {
+      const pk = e.target.closest('[data-pick]');
+      if (pk) { const id = +pk.dataset.pick; sel.has(id) ? sel.delete(id) : sel.add(id); pk.classList.toggle('on', sel.has(id)); pk.setAttribute('aria-checked', sel.has(id)); $('#duo-count').textContent = sel.size; haptic('select'); return; }
+      if (e.target.closest('#duo-go')) {
+        if (!sel.size) return toast('Выбери хотя бы один трек', 'err');
+        try { const r = await API.post(`/api/duo/${did}/add`, { track_ids: [...sel] }); closeSheet(); toast(r.added ? `+${tracksWord(r.added)} в парный плейлист` : 'Эти треки уже там'); haptic('success'); openDuo(did); refreshDuos(); }
+        catch (err) { toast(err.message, 'err'); }
+      }
+    });
+  });
+}
+async function refreshDuos() {
+  try { const r = await API.get('/api/duos'); S.duos = r.duos; } catch (_) { return; }
+  const rail = $('#duo-rail'); if (rail) rail.innerHTML = duoRailHTML();
+}
+async function addToDuo(t) {
+  const active = S.duos.filter((d) => d.state === 'active');
+  if (!active.length) return toast('Сначала создай парный плейлист в Топе', 'err');
+  const add = async (did) => {
+    try { const r = await API.post(`/api/duo/${did}/add`, { track_ids: [t.id] }); toast(r.added ? 'Добавил в парный плейлист 💞' : 'Этот трек уже там'); haptic('success'); refreshDuos(); }
+    catch (e) { toast(e.message, 'err'); }
+  };
+  if (active.length === 1) return add(active[0].id);
+  openSheet(`<div class="sheet-head" style="border:0"><h3>В какой<br>парный?</h3></div>
+    ${active.map((d) => `<button class="act" data-act="duo-pick-add" data-did="${esc(d.id)}" data-tid="${t.id}">${I.duo}${esc(d.title)}<span class="hint">с ${esc(d.partner.name)}</span></button>`).join('')}`);
+  ACTIONS['duo-pick-add'] = (el) => { closeSheet(); add(el.dataset.did); };
+}
+
+/* ------------------------------------------------------------------ Ewa */
+const EWA_KEY = 'vc-ewa';
+function ewaLoad() {
+  if (S.ewa.loaded) return; S.ewa.loaded = true;
+  try { const raw = localStorage.getItem(EWA_KEY + (S.user && S.user.id ? ':' + S.user.id : '')); if (raw) S.ewa.msgs = JSON.parse(raw).slice(-30); } catch (_) { /* storage off */ }
+}
+function ewaSave() {
+  try { localStorage.setItem(EWA_KEY + (S.user && S.user.id ? ':' + S.user.id : ''), JSON.stringify(S.ewa.msgs.slice(-30).map((m) => ({ ...m, tracks: (m.tracks || []).slice(0, 6) })))); } catch (_) { /* storage off */ }
+}
+function ewaSuggestions() {
+  const top = S.order.slice(0, 40).map(T).filter(Boolean).map((t) => t.artist);
+  const fav = top.sort((a, b) => top.filter((x) => x === b).length - top.filter((x) => x === a).length)[0];
+  return ['Что послушать вечером?', 'Как перенести из Яндекс Музыки?', fav ? `Найди что-то похожее на ${fav}` : 'Посоветуй что-нибудь бодрое', 'Что такое парный плейлист?', 'Музыка для концентрации'];
+}
+const EWA_LABELS = { import: 'Перенос', yandex: 'Из Яндекс Музыки', library: 'Медиатека', mixtapes: 'Микстейпы', leaders: 'Топ', home: 'Главная' };
+function ewaMsgHTML(m, i) {
+  if (m.role === 'me') return `<div class="msg me">${esc(m.text)}</div>`;
+  const tracks = (m.tracks || []).map((t) => { if (!S.tracks.has(t.id)) S.tracks.set(t.id, t); return rowHTML(T(t.id), { remote: true }).replace('data-act="play-remote"', 'data-act="ewa-play"').replace('data-act="add-remote"', 'data-act="ewa-add"'); }).join('');
+  const acts = (m.actions || []).map((a) => `<button data-act="ewa-open" data-v="${esc(a.open)}">→ ${esc(EWA_LABELS[a.open] || a.open)}</button>`).join('');
+  return `<div class="msg ewa">${esc(m.text)}</div>${tracks ? `<div class="ewa-tracks" data-queue="ewa-${i}" data-source="Ewa">${tracks}</div>` : ''}${acts ? `<div class="ewa-acts">${acts}</div>` : ''}`;
+}
+function renderEwaLog() {
+  const log = $('#ewa .ewa-log'); if (!log) return;
+  const hello = { role: 'ewa', text: `Привет${S.user && S.user.first_name ? ', ' + S.user.first_name : ''}! Я Ewa 💜 Подберу музыку под настроение, найду трек по описанию и подскажу, как устроен VibeCloud.` };
+  log.innerHTML = [hello, ...S.ewa.msgs].map(ewaMsgHTML).join('') + (S.ewa.busy ? '<div class="msg ewa typing"><i></i><i></i><i></i></div>' : '');
+  log.scrollTop = log.scrollHeight;
+  highlightPlaying();
+}
+function openEwa(prefill = '') {
+  ewaLoad();
+  let el = $('#ewa');
+  if (!el) { el = document.createElement('div'); el.id = 'ewa'; el.setAttribute('role', 'dialog'); el.setAttribute('aria-label', 'Ewa'); document.body.appendChild(el); }
+  el.innerHTML = `
+    <header class="ewa-head"><button class="icon-btn" data-act="close-ewa" aria-label="Назад">${I.back}</button><span class="orb lg">E</span>
+      <div class="t"><b>Ewa</b><small><i></i>${S.config && S.config.ai ? 'AI-ассистент · онлайн' : 'ассистент · онлайн'}</small></div>
+      <button class="icon-btn" data-act="ewa-clear" aria-label="Очистить">${I.trash}</button></header>
+    <div class="ewa-log" aria-live="polite"></div>
+    <div class="ewa-sugg"${S.ewa.msgs.length > 2 ? ' hidden' : ''}>${ewaSuggestions().map((q) => `<button data-act="ewa-sugg">${esc(q)}</button>`).join('')}</div>
+    <form class="ewa-input" data-form="ewa"><label class="sr" for="ewa-in">Сообщение</label>
+      <textarea id="ewa-in" rows="1" placeholder="Спроси Ewa…" enterkeyhint="send" maxlength="800"></textarea>
+      <button class="btn btn-lime" type="submit" aria-label="Отправить">${I.arrowUp}</button></form>`;
+  el.classList.add('on');
+  pushCloser(closeEwa);
+  renderEwaLog();
+  const ta = $('#ewa-in'); if (prefill) ta.value = prefill;
+  setTimeout(() => ta.focus(), 250);
+  haptic('medium');
+}
+function closeEwa() { const el = $('#ewa'); if (el) el.classList.remove('on'); }
+async function ewaSend(text) {
+  text = (text || '').trim(); if (!text || S.ewa.busy) return;
+  const history = S.ewa.msgs.slice(-10).map((m) => ({ role: m.role === 'me' ? 'user' : 'assistant', text: m.text }));
+  S.ewa.msgs.push({ role: 'me', text }); S.ewa.busy = true; renderEwaLog(); haptic('light');
+  const sugg = $('#ewa .ewa-sugg'); if (sugg && S.ewa.msgs.length > 2) sugg.hidden = true;
+  try {
+    const r = await API.post('/api/ewa', { text, history });
+    S.ewa.msgs.push({ role: 'ewa', text: r.text, tracks: r.tracks || [], actions: r.actions || [] });
+  } catch (e) { S.ewa.msgs.push({ role: 'ewa', text: 'Не получилось ответить: ' + e.message }); }
+  S.ewa.busy = false; ewaSave(); renderEwaLog();
+}
+
+/* ------------------------------------------------------------------ v2 actions */
+Object.assign(ACTIONS, {
+  'go-leaders': () => go('leaders'),
+  ewa: () => openEwa(), 'close-ewa': () => popCloser(),
+  'ewa-clear': () => { S.ewa.msgs = []; ewaSave(); renderEwaLog(); },
+  'ewa-sugg': (el) => ewaSend(el.textContent),
+  'ewa-open': (el) => { const v = el.dataset.v; popCloser(); if (v === 'yandex') { go('import'); setTimeout(() => { const y = $('#ya'); if (y) y.scrollIntoView({ behavior: 'smooth' }); }, 150); } else go(v); },
+  'ewa-play': (el) => { const id = +el.closest('[data-tid]').dataset.tid; const { ids } = queueFrom(el); playQueue(ids, id, 'Ewa'); },
+  'ewa-add': async (el) => {
+    const id = +el.closest('[data-tid]').dataset.tid;
+    try { const r = await API.post(`/api/track/${id}/add`); upsertTrack({ ...r, _new: true }, { prepend: true }); el.innerHTML = I.check; toast('В медиатеке ✦'); haptic('success');
+      S.ewa.msgs.forEach((m) => (m.tracks || []).forEach((t) => { if (t.id === id) t.in_library = true; })); ewaSave(); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+  'paste-ya': async () => { const t = await readClipboard(); if (!t) return toast('Буфер пуст', 'err'); const ta = $('#ya-text'); ta.value = t; yaDetect(t); },
+  'list-report': (el) => { const j = S.transit.get(el.dataset.job); if (j && j.status === 'running') return toast(`Ищу… ${j.added || 0} из ${j.total}`); listReport(el.dataset.job); },
+  'miss-search': (el) => { closeSheet(); S.q = el.dataset.q; S.filter = 'all'; go('library', { force: true }); const inp = $('#lib-q'); if (inp) { inp.value = S.q; inp.dispatchEvent(new Event('input', { bubbles: true })); } },
+  period: (el) => { haptic('select'); loadLeaders(el.dataset.p); },
+  'toggle-hidden': async (el) => {
+    const hidden = el.classList.contains('on'); el.classList.toggle('on', !hidden); haptic('select');
+    try { await API.post('/api/me/hidden', { hidden }); toast(hidden ? 'Тебя больше не видно в топе' : 'Ты снова в топе'); loadLeaders(); } catch (e) { toast(e.message, 'err'); }
+  },
+  user: (el) => userSheet(el.closest('[data-uid]').dataset.uid),
+  'status-preset': (el) => { const i = $('#st-in'); if (i) { i.value = el.dataset.v; haptic('select'); } },
+  'set-status': async (el) => {
+    const status = el.dataset.clear ? '' : ($('#st-in') || {}).value || '';
+    try { const r = await API.post('/api/admin/status', { user_id: +el.dataset.uid, status }); closeSheet(); toast(r.status ? `Статус «${r.status}» выдан ✦` : 'Статус снят'); haptic('success'); loadLeaders(); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+  'duo-help': () => openSheet(`<div class="sheet-head" style="border:0"><h3>Парный<br>плейлист</h3></div>
+    <div class="ways" style="margin-top:0">
+      <div class="way"><span class="n">01</span><div><b>Выбери человека</b><span>Нажми на любого слушателя в топе → «Создать парный плейлист».</span></div></div>
+      <div class="way"><span class="n">02</span><div><b>Он принимает</b><span>Приглашение придёт в бот. Плейлист сразу наполнится треками, которые есть у вас обоих.</span></div></div>
+      <div class="way"><span class="n">03</span><div><b>Собирайте вдвоём</b><span>Оба добавляют треки, кнопка ✦ подкинет общие вкусы. Видно, кто что добавил.</span></div></div>
+    </div>`),
+  'duo-new': () => { if (!S.leaders) return loadLeaders().then(duoPickSheet); duoPickSheet(); },
+  'duo-invite': (el) => { closeSheet(); setTimeout(() => duoInviteSheet(+el.dataset.uid, el.dataset.name), 280); },
+  'duo-send': async (el) => {
+    el.disabled = true;
+    try { const d = await API.post('/api/duos', { user_id: +el.dataset.uid, title: ($('#duo-title') || {}).value || '' }); closeSheet(); S.duos = [d, ...S.duos.filter((x) => x.id !== d.id)]; toast('Приглашение отправлено 💌'); haptic('success'); const rail = $('#duo-rail'); if (rail) rail.innerHTML = duoRailHTML(); }
+    catch (e) { toast(e.message, 'err'); el.disabled = false; }
+  },
+  'open-duo': (el) => { closeSheet(); openDuo(el.closest('[data-did]').dataset.did); },
+  'duo-accept': async (el) => {
+    try { const d = await API.post(`/api/duo/${el.dataset.did}/accept`); S.duos = [d, ...S.duos.filter((x) => x.id !== d.id)]; toast('Теперь собираете вместе 💞'); haptic('success'); refreshDuos(); openDuo(d.id); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+  'duo-decline': async (el) => {
+    try { await API.post(`/api/duo/${el.dataset.did}/decline`); S.duos = S.duos.filter((x) => x.id !== el.dataset.did); toast('Приглашение отклонено'); if ($('#detail').dataset.duo === el.dataset.did) closeDetail(); refreshDuos(); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+  'duo-add': (el) => duoAddSheet(el.dataset.did),
+  'duo-fill': async (el) => {
+    toast('Смотрю, что вы оба любите…');
+    try { const r = await API.post(`/api/duo/${el.dataset.did}/fill`); toast(r.added ? `+${tracksWord(r.added)} ✦` : 'Всё общее уже здесь'); haptic('success'); openDuo(el.dataset.did); refreshDuos(); }
+    catch (e) { toast(e.message, 'err'); }
+  },
+  'duo-del': async (el) => {
+    const go2 = async () => { try { await API.del(`/api/duo/${el.dataset.did}`); S.duos = S.duos.filter((x) => x.id !== el.dataset.did); closeDetail(); refreshDuos(); toast('Парный плейлист удалён'); } catch (e) { toast(e.message, 'err'); } };
+    if (tg && tg.showConfirm && tgv('6.2')) tg.showConfirm('Удалить парный плейлист у вас обоих?', (ok) => ok && go2()); else go2();
+  },
+  'play-duo': () => { const ids = $$('#detail [data-tid]').map((x) => +x.dataset.tid); if (ids.length) playQueue(ids, ids[0], $('#detail [data-source]').dataset.source); },
+  's-duo': (el) => { closeSheet(); addToDuo(T(el.dataset.tid)); },
+});
+
 /* closers stack: Telegram BackButton closes the top layer */
 function pushCloser(fn) { S.closers = S.closers.filter((f) => f !== fn); S.closers.push(fn); syncBack(); }
 function popCloser() { const fn = S.closers.pop(); if (fn) fn(); syncBack(); }
 function syncBack() {
-  S.closers = S.closers.filter((fn) => (fn === closePlayer ? $('#player').classList.contains('on') : fn === closeDetail ? $('#detail').classList.contains('on') : fn === closeSheet ? $('#sheet').classList.contains('on') : false) || fn === S.closers[S.closers.length - 1]);
+  const isOn = (sel) => { const el = $(sel); return !!el && el.classList.contains('on'); };
+  S.closers = S.closers.filter((fn) => (fn === closePlayer ? isOn('#player') : fn === closeDetail ? isOn('#detail') : fn === closeSheet ? isOn('#sheet') : fn === closeEwa ? isOn('#ewa') : false) || fn === S.closers[S.closers.length - 1]);
   if (!tg || !tg.BackButton) return;
   S.closers.length ? tg.BackButton.show() : tg.BackButton.hide();
 }
 
 /* ------------------------------------------------------------------ live events */
 function onEvent(name, data) {
+  if (name === 'tracks_added') {
+    (data.tracks || []).forEach((track) => onEvent('track_added', { job: data.job, playlist: data.playlist, track }));
+    return;
+  }
+  if (name === 'duo') {
+    S.duos = [data, ...S.duos.filter((d) => d.id !== data.id)];
+    if (data.incoming) { toast(`💞 ${data.partner.name} зовёт в парный плейлист`); haptic('success'); }
+    const rail = $('#duo-rail'); if (rail) rail.innerHTML = duoRailHTML();
+    if ($('#detail').classList.contains('on') && $('#detail').dataset.duo === data.id) openDuo(data.id);
+    syncNavBadges(); return;
+  }
+  if (name === 'duo_gone') {
+    S.duos = S.duos.filter((d) => d.id !== data.id);
+    const rail = $('#duo-rail'); if (rail) rail.innerHTML = duoRailHTML();
+    syncNavBadges(); return;
+  }
+  if (name === 'status') { if (S.user) S.user.status = data.status; if (data.status) toast(`✨ Твой новый статус: ${data.status}`); if (S.view === 'leaders') loadLeaders(); return; }
   if (name === 'track_added') {
     const t = { ...data.track, _new: true };
     const isNew = upsertTrack(t, { prepend: true });
@@ -1141,7 +1580,12 @@ function onEvent(name, data) {
   } else if (name === 'job') {
     const j = S.transit.get(data.id) || { ids: [] };
     S.transit.set(data.id, { ...j, ...data, ids: j.ids });
-    if (data.status === 'done') {
+    if (data.status === 'done' && data.kind === 'list') {
+      haptic('success');
+      if (data.playlist) S.playlists = [data.playlist, ...S.playlists.filter((p) => p.id !== data.playlist.id)];
+      setTimeout(() => listReport(data.id), 500);
+      setTimeout(() => { S.transit.delete(data.id); refreshTransit(true); }, 6000);
+    } else if (data.status === 'done') {
       haptic('success');
       toast(data.kind === 'track' ? `«${data.title}» в медиатеке` : `✓ «${data.title}» — ${tracksWord(data.total)}`);
       if (data.playlist) { S.playlists = [data.playlist, ...S.playlists.filter((p) => p.id !== data.playlist.id)]; if (S.stats) S.stats.playlists = S.playlists.length; }
@@ -1185,11 +1629,12 @@ function scheduleTransitAndLists() {
 
 function connectEvents() {
   if (DEMO) { window.VCDemo.subscribe(onEvent); return; }
-  const url = `/api/events?auth=${encodeURIComponent(tg.initData)}`;
+  // a signed token, not initData: the Telegram login payload never ends up in URLs or proxy logs
+  const url = S.eventsToken ? `/api/events?t=${encodeURIComponent(S.eventsToken)}` : `/api/events?auth=${encodeURIComponent(tg.initData)}`;
   let es, retry = 1000;
   const open = () => {
     es = new EventSource(url);
-    ['track_added', 'track_status', 'job', 'playlist', 'need_choice', 'import_error', 'toast'].forEach((n) =>
+    ['track_added', 'tracks_added', 'track_status', 'job', 'playlist', 'need_choice', 'import_error', 'toast', 'duo', 'duo_gone', 'status'].forEach((n) =>
       es.addEventListener(n, (e) => { try { onEvent(n, JSON.parse(e.data)); } catch (_) { /* bad frame */ } }));
     es.addEventListener('hello', () => { retry = 1000; });
     es.onerror = () => { es.close(); setTimeout(open, retry); retry = Math.min(retry * 2, 15000); };
@@ -1200,6 +1645,8 @@ function connectEvents() {
 /* ------------------------------------------------------------------ boot */
 function bindGlobal() {
   document.addEventListener('pointerdown', unlockAudio, { once: true, capture: true });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushListen(true); });
+  addEventListener('pagehide', () => flushListen(true));
   document.addEventListener('click', (e) => {
     const el = e.target.closest('[data-act]'); if (!el) return;
     const inner = e.target.closest('button[data-act]');
@@ -1210,10 +1657,14 @@ function bindGlobal() {
   document.addEventListener('keydown', (e) => {
     if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('[role="button"][data-act]')) { e.preventDefault(); e.target.click(); }
     if (e.key === 'Escape') popCloser();
+    if (e.key === 'Enter' && !e.shiftKey && e.target.id === 'ewa-in') { e.preventDefault(); e.target.form.requestSubmit ? e.target.form.requestSubmit() : e.target.form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true })); }
   });
   document.addEventListener('submit', (e) => {
     e.preventDefault();
-    const f = e.target, v = (f.url && f.url.value) || '';
+    const f = e.target;
+    if (f.dataset.form === 'ewa') { const ta = $('#ewa-in'); ewaSend(ta.value); ta.value = ''; ta.style.height = ''; return; }
+    if (f.dataset.form === 'list') { startListImport($('#ya-text').value, S.yaTitle); S.yaTitle = null; return; }
+    const v = (f.url && f.url.value) || '';
     startImport(v); if (f.url) f.url.value = '';
     const det = $('#detected'); if (det) { det.textContent = 'Жду ссылку…'; det.className = 'detected'; }
   });
@@ -1228,6 +1679,8 @@ function bindGlobal() {
         try { const r = await API.get(`/api/search?q=${encodeURIComponent(q)}`); if (S.q.trim() !== q) return; S.remote = r.results; S.remoteQ = S.q; r.results.forEach((t) => { if (!S.tracks.has(t.id)) S.tracks.set(t.id, t); }); renderLibrary({ keepSearch: true }); } catch (_) { /* offline */ }
       }, 420);
     }
+    if (e.target.id === 'ya-text') yaDetect(e.target.value);
+    if (e.target.id === 'ewa-in') { e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px'; }
     if (e.target.id === 'imp-url') {
       const k = linkKind(e.target.value), det = $('#detected');
       const n = (e.target.value.match(new RegExp(LINK_RE.source, 'gi')) || []).length;
@@ -1235,8 +1688,23 @@ function bindGlobal() {
       det.className = 'detected' + (k ? ' ok' : '');
     }
   });
-  document.addEventListener('focusin', (e) => { if (e.target.id === 'imp-url') e.target.closest('.field').classList.add('focus'); });
-  document.addEventListener('focusout', (e) => { if (e.target.id === 'imp-url') e.target.closest('.field').classList.remove('focus'); });
+  document.addEventListener('focusin', (e) => { if (e.target.id === 'imp-url' || e.target.id === 'ya-text') e.target.closest('.field').classList.add('focus'); });
+  document.addEventListener('focusout', (e) => { if (e.target.id === 'imp-url' || e.target.id === 'ya-text') e.target.closest('.field').classList.remove('focus'); });
+  document.addEventListener('change', (e) => {
+    if (e.target.id !== 'ya-file' || !e.target.files[0]) return;
+    const f = e.target.files[0];
+    if (f.size > 3 * 1024 * 1024) return toast('Файл больше 3 МБ', 'err');
+    const rd = new FileReader();
+    rd.onload = () => {
+      let text = String(rd.result || '');
+      if (/\.m3u8?$/i.test(f.name)) text = text.split(/\r?\n/).filter((l) => l.startsWith('#EXTINF') && l.includes(',')).map((l) => l.slice(l.indexOf(',') + 1)).join('\n');
+      const ta = $('#ya-text'); ta.value = text; yaDetect(text);
+      const base = f.name.replace(/\.[^.]+$/, ''); S.yaTitle = /^(export|tracks|playlist|список)$/i.test(base) ? null : base.slice(0, 60);
+      toast(`Файл «${f.name}» загружен`);
+    };
+    rd.readAsText(f);
+    e.target.value = '';
+  });
   $('#nav').addEventListener('click', (e) => { const b = e.target.closest('button[data-view]'); if (b) go(b.dataset.view); });
   addEventListener('resize', () => { const b = $$('#nav button')[VIEWS.indexOf(S.view)]; $('#nav .blob').style.transform = `translateX(${b.offsetLeft - 6}px)`; });
 }
@@ -1246,7 +1714,13 @@ function buildChrome() {
     <button data-view="home" class="on" aria-label="Главная">${I.home}</button>
     <button data-view="library" aria-label="Медиатека">${I.lib}</button>
     <button data-view="import" aria-label="Перенос">${I.move}</button>
+    <button data-view="leaders" aria-label="Топ и парные плейлисты">${I.trophy}</button>
     <button data-view="mixtapes" aria-label="Микстейпы">${I.gift}</button>`;
+}
+function syncNavBadges() {
+  const btn = $$('#nav button')[3]; if (!btn) return;
+  const n = S.duos.filter((d) => d.incoming).length, b = $('.badge', btn);
+  if (n && !b) btn.insertAdjacentHTML('beforeend', '<span class="badge"></span>'); else if (!n && b) b.remove();
 }
 
 function intro() {
@@ -1261,6 +1735,7 @@ function intro() {
 function routeStart() {
   const sp = (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || '';
   const open = params.get('open') || sp.replace('_', ':');
+  syncNavBadges();
   if (!open) return;
   const [kind, id] = open.split(':');
   if (kind === 'tr' && id) {
@@ -1268,6 +1743,9 @@ function routeStart() {
     if (t) { playQueue(S.order, t.id, 'Медиатека'); setTimeout(openPlayer, 200); }
     else API.post(`/api/track/${id}/add`).then((r) => { upsertTrack({ ...r, _new: true }, { prepend: true }); render(); playQueue([r.id], r.id, 'От друга'); setTimeout(openPlayer, 200); toast('Трек от друга сохранён ✦'); }).catch(() => {});
   } else if (kind === 'mx' && id) openMixtape(id);
+  else if (kind === 'duo' && id) { go('leaders'); openDuo(id); }
+  else if (kind === 'ewa') openEwa();
+  else if (kind === 'yandex') { go('import'); setTimeout(() => { const y = $('#ya'); if (y) y.scrollIntoView({ behavior: 'smooth' }); }, 200); }
   else if (kind === 'pl' && id) openPlaylist(id);
   else if (VIEWS.includes(kind)) go(kind);
 }
@@ -1293,7 +1771,7 @@ async function boot() {
     S.user = { ...(d.user || {}), photo_url: (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.photo_url) || (d.user && d.user.photo_url) };
     S.stats = d.stats; S.config = d.config || {};
     d.tracks.forEach((t) => upsertTrack(t));
-    S.playlists = d.playlists; S.mixtapes = d.mixtapes;
+    S.playlists = d.playlists; S.mixtapes = d.mixtapes; S.duos = d.duos || []; S.eventsToken = d.events_token;
     (d.jobs || []).filter((j) => j.status === 'running').forEach((j) => S.transit.set(j.id, { ...j, ids: [] }));
   } catch (e) {
     toast(e.message || 'Нет связи с сервером', 'err');
@@ -1304,6 +1782,6 @@ async function boot() {
   routeStart();
 }
 
-window.VC = { S, P, go, openPlayer, openPlaylist, openMixtape, mixtapeSheet, trackSheet, startImport, onEvent };
+window.VC = { S, P, go, openPlayer, openPlaylist, openMixtape, mixtapeSheet, trackSheet, startImport, onEvent, openEwa, ewaSend, openDuo, userSheet, listReport };
 document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', boot) : boot();
 })();

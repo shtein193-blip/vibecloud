@@ -4,13 +4,16 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
+from .assistant import Ewa
 from .config import Settings
 from .db import DB
 from .downloader import Downloader
 from .events import EventBus
 from .importer import Importer
+from .listimport import ListImporter
 from .security import Signer
 from .soundcloud import SoundCloud
+from .tasks import TTLCache
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -27,10 +30,17 @@ class Ctx:
     sc: SoundCloud
     dl: Downloader
     importer: Importer
+    lists: ListImporter
+    ewa: Ewa
     bot: "Bot | None" = None
     tg: "TelegramIO | None" = None
     bot_username: str = "VibeCloudBot"
-    pending_links: dict[str, str] = field(default_factory=dict)
+    # short-lived choices from bot buttons (profile import mode, track lists) — bounded, expire in 1 h
+    pending_links: TTLCache = field(default_factory=lambda: TTLCache(maxsize=500, ttl=3600))
+    ready: bool = True
+
+    def is_admin(self, uid: int) -> bool:
+        return uid in self.settings.admin_ids
 
     def app_link(self, payload: str) -> str:
         """Public deep link that opens the Mini App (works in any chat)."""

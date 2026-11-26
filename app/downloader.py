@@ -13,12 +13,10 @@ import time
 from pathlib import Path
 from typing import Awaitable, Callable
 
-import yt_dlp
-from mutagen.id3 import COMM, ID3, TALB, TIT2, TPE1, ID3NoHeaderError
-
 from .config import Settings
 from .db import DB
 from .events import EventBus
+from .tasks import spawn
 
 log = logging.getLogger(__name__)
 
@@ -80,13 +78,13 @@ class Downloader:
         fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
         self.pending[tid] = fut
         self._put(tid, priority)
-        asyncio.create_task(self._mark(tid, "queued"))
+        spawn(self._mark(tid, "queued"))
         return fut
 
     def release_later(self, tid: int, delay: float = 90) -> None:
         """LITE: the track is in Telegram now — drop the local copy soon (kept a bit for an active listener)."""
         if self.s.lite_mode:
-            self.loop.call_later(delay, lambda: asyncio.create_task(self._release(tid)))
+            self.loop.call_later(delay, lambda: spawn(self._release(tid)))
 
     async def _release(self, tid: int) -> None:
         if tid in self.pending or tid in self.active:
@@ -112,7 +110,7 @@ class Downloader:
         fut = self.prefetch(tid, priority=0)
         if tid not in self.active and len(self.active) >= self.s.download_workers:
             # every worker is busy with background prefetch — don't make the listener wait in line
-            asyncio.create_task(self._express(tid))
+            spawn(self._express(tid))
         return await asyncio.shield(fut)
 
     async def _express(self, tid: int) -> None:
@@ -188,7 +186,7 @@ class Downloader:
                                                file_size=final.stat().st_size, error=None,
                                                last_access=int(time.time()))
                     self.release_later(tid, 900)
-                    asyncio.create_task(self._evict())
+                    spawn(self._evict())
                     return final
             except Exception as ex:  # noqa: BLE001
                 log.info("telegram fetch %s failed, falling back to SoundCloud: %s", tid, ex)
@@ -227,11 +225,11 @@ class Downloader:
                               {"id": tid, "status": "ready", "progress": 100})
         if row["tg_file_id"]:
             self.release_later(tid, 900)
-        asyncio.create_task(self._evict())
+        spawn(self._evict())
         return final
 
     def _progress(self, tid: int, pct: int) -> None:
-        asyncio.create_task(self._emit_progress(tid, pct))
+        spawn(self._emit_progress(tid, pct))
 
     async def _emit_progress(self, tid: int, pct: int) -> None:
         self.progress[tid] = pct
@@ -257,6 +255,7 @@ class Downloader:
                 {"key": "EmbedThumbnail"},
             ],
         }
+        import yt_dlp  # heavy (~30 MB RAM): loaded on the first real download, not at startup
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
         mp3 = next(work.glob("*.mp3"), None)
@@ -266,6 +265,7 @@ class Downloader:
 
     @staticmethod
     def _tag(path: Path, row: dict) -> None:
+        from mutagen.id3 import COMM, ID3, TALB, TIT2, TPE1, ID3NoHeaderError
         try:
             tags = ID3(path)
         except ID3NoHeaderError:

@@ -31,17 +31,18 @@ async def _rows_for_query(ctx: Ctx, uid: int, text: str) -> list[dict]:
         local = await db.search_library(uid, text, 10)
         raw = await ctx.sc.search(text, 15)
         seen = {x["id"] for x in local}
-        for t in raw:
-            if t["id"] not in seen:
-                await db.upsert_track(track_meta(t))
-        return local + [await db.get_track(t["id"]) for t in raw if t["id"] not in seen]
+        metas = [track_meta(t) for t in raw if t["id"] not in seen]
+        await db.upsert_tracks(metas)
+        rows = await db.library_entries(uid, [m["id"] for m in metas])
+        return local + [rows[m["id"]] for m in metas if m["id"] in rows]
     else:
         return await db.all(
             """SELECT t.* FROM library l JOIN tracks t ON t.id=l.track_id WHERE l.user_id=?
                ORDER BY l.last_played DESC, l.added_at DESC LIMIT 20""", (uid,))
-    for t in raw:
-        await db.upsert_track(track_meta(t))
-    return [await db.get_track(t["id"]) for t in raw]
+    metas = [track_meta(t) for t in raw]
+    await db.upsert_tracks(metas)
+    rows = await db.library_entries(uid, [m["id"] for m in metas])
+    return [rows[m["id"]] for m in metas if m["id"] in rows]
 
 
 @router.inline_query()

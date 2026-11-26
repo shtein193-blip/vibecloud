@@ -61,7 +61,18 @@ class Settings:
     lite_mode: bool
     mp3_max_kbps: int
     db_backup_min: int
+    admin_ids: frozenset[int]
+    ai_base_url: str | None
+    ai_api_key: str | None
+    ai_model: str | None
+    list_import_max: int
+    ytdlp_autoupdate: bool
+    on_render: bool
     secret: bytes = field(repr=False)
+
+    @property
+    def ai_enabled(self) -> bool:
+        return bool(self.ai_base_url and self.ai_model and (self.ai_api_key or "localhost" in self.ai_base_url))
 
     @property
     def max_upload_bytes(self) -> int:
@@ -81,6 +92,24 @@ class Settings:
         return self.data_dir / "vibecloud.db"
 
 
+# Бесплатные OpenAI-совместимые провайдеры для ассистента Ewa (ключ без карты).
+AI_PRESETS = {
+    "groq": ("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.5-flash"),
+    "openrouter": ("https://openrouter.ai/api/v1", "meta-llama/llama-3.3-70b-instruct:free"),
+    "cerebras": ("https://api.cerebras.ai/v1", "llama-3.3-70b"),
+}
+
+
+def _ids(name: str) -> frozenset[int]:
+    out = set()
+    for part in os.getenv(name, "").replace(";", ",").split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            out.add(int(part))
+    return frozenset(out)
+
+
 def load_settings() -> Settings:
     _load_dotenv()
     token = os.getenv("BOT_TOKEN", "").strip()
@@ -91,6 +120,8 @@ def load_settings() -> Settings:
     # LITE_MODE: Telegram-first. Player streams straight from SoundCloud's CDN, files live in Telegram
     # (file_id), the server keeps only a tiny temporary cache and downloads nothing in advance.
     lite = _bool("LITE_MODE", True)
+    # провайдер ассистента: явный AI_PROVIDER, иначе groq, если задан только ключ
+    ai_provider = (os.getenv("AI_PROVIDER") or ("groq" if os.getenv("AI_API_KEY") else "")).strip().lower()
     return Settings(
         bot_token=token,
         # RENDER_EXTERNAL_URL is set automatically on Render (https://<service>.onrender.com)
@@ -114,6 +145,13 @@ def load_settings() -> Settings:
         mp3_max_kbps=_int("MP3_MAX_KBPS", 192),
         # opt-in: keep a copy of the SQLite DB in the storage channel (for ephemeral disks like Render free)
         # на Render диск стирается при перезапуске/деплое — там бэкап базы включён по умолчанию
-        db_backup_min=_int("DB_BACKUP_MIN", 10 if os.getenv("RENDER") else 0),
+        db_backup_min=_int("DB_BACKUP_MIN", 2 if os.getenv("RENDER") else 0),
+        admin_ids=_ids("ADMIN_IDS"),
+        ai_base_url=(os.getenv("AI_BASE_URL") or AI_PRESETS.get(ai_provider, (None, None))[0] or "").rstrip("/") or None,
+        ai_api_key=os.getenv("AI_API_KEY") or None,
+        ai_model=os.getenv("AI_MODEL") or AI_PRESETS.get(ai_provider, (None, None))[1],
+        list_import_max=_int("LIST_IMPORT_MAX", 1500),
+        ytdlp_autoupdate=_bool("YTDLP_AUTOUPDATE", bool(os.getenv("RENDER"))),
+        on_render=bool(os.getenv("RENDER")),
         secret=hashlib.sha256(b"vibecloud:" + secret_seed.encode()).digest(),
     )
