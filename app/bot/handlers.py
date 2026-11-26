@@ -14,7 +14,7 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, Inl
 import re
 import time
 
-from .. import social
+from .. import social, yandex
 from ..context import Ctx
 from ..db import new_id
 from ..downloader import DownloadError
@@ -187,8 +187,9 @@ async def cmd_statuses(message: Message, ctx: Ctx):
 
 
 # ---------------- track lists (Yandex Music & co) ----------------
-async def _run_list(message: Message, ctx: Ctx, uid: int, text: str, title: str | None = None):
-    items = parse_tracklist(text)
+async def _run_list(message: Message, ctx: Ctx, uid: int, text: str, title: str | None = None,
+                    items: list[dict] | None = None):
+    items = items if items is not None else parse_tracklist(text)
     n = min(len(items), ctx.settings.list_import_max)
     status = await message.answer(f"🔎 Ищу {tracks_word(n)} на SoundCloud…\n{bar(0)} 0/{n}")
     last = {"t": 0.0}
@@ -202,7 +203,7 @@ async def _run_list(message: Message, ctx: Ctx, uid: int, text: str, title: str 
         except TelegramBadRequest:
             pass
     try:
-        res = await ctx.lists.run(uid, text, title, on_progress=progress)
+        res = await ctx.lists.run(uid, text, title, on_progress=progress, items=items)
     except SoundCloudError as ex:
         return await status.edit_text(f"😕 {e(str(ex))}")
     miss = res["missing"]
@@ -264,6 +265,14 @@ async def on_links(message: Message, ctx: Ctx):
             return
         text = message.text or message.caption or ""
         uid = await _user(ctx, message)
+        if (ylink := yandex.find_link(text)) and len(parse_tracklist(text.replace(ylink, ""))) < 2:
+            status = await message.answer("🔎 Читаю плейлист Яндекс Музыки…")
+            try:
+                pl = await yandex.fetch(ylink, ctx.settings.list_import_max)
+            except yandex.YandexError as ex:
+                return await status.edit_text(f"😕 {e(str(ex))}")
+            await _safe_delete(status)
+            return await _run_list(message, ctx, uid, "", pl["title"], items=pl["items"])
         if m := EWA_PREFIX.match(text):
             return await _ewa_answer(message, ctx, uid, text[m.end():])
         items = parse_tracklist(text) if text.count("\n") >= 1 else []

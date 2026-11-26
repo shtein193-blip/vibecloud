@@ -107,6 +107,7 @@ MIGRATIONS = [
     ("users", "status", "TEXT"),
     ("users", "hidden", "INTEGER DEFAULT 0"),
     ("jobs", "report", "TEXT"),
+    ("jobs", "found", "INTEGER DEFAULT 0"),
 ]
 
 TRACK_META_FIELDS = (

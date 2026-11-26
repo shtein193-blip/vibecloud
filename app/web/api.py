@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
+import re
 import logging
 import time
 from pathlib import Path
@@ -11,7 +13,7 @@ from aiohttp import web
 
 import asyncio
 
-from .. import social
+from .. import social, yandex
 from ..context import Ctx
 from ..downloader import DownloadError
 from ..importer import NeedChoice
@@ -519,27 +521,33 @@ async def import_list(request: web.Request):
     ctx: Ctx = request.app[CTX]
     uid = uid_of(request)
     body = await _body(request)
-    text = str(body.get("text") or "")
-    items = parse_tracklist(text)
-    if not items:
-        return web.json_response({"error": "Не нашёл треков. Нужен список «Исполнитель — Название» по строке, "
-                                           "CSV/JSON или текст, скопированный со страницы плейлиста"}, status=400)
     if uid in ctx.lists.running:
-        return web.json_response({"error": "Предыдущий список ещё переносится"}, status=409)
-
-    async def go():
+        return web.json_response({"error": "Предыдущий список ещё переносится", "job_id": ctx.lists.running[uid]},
+                                 status=409)
+    text = str(body.get("text") or "")
+    link = yandex.find_link(text)
+    if link and len(parse_tracklist(text.replace(link, ""))) < 2:  # a Yandex Music link instead of a list
         try:
-            await ctx.lists.run(uid, text, body.get("title"))
-        except Exception as ex:  # noqa: BLE001
-            ctx.bus.publish(uid, "import_error", {"url": "list", "error": str(ex)})
-    spawn(go(), "list-import")
-    return ok(count=min(len(items), ctx.settings.list_import_max), total=len(items),
-              sample=items[:5])
+            pl = await yandex.fetch(link, ctx.settings.list_import_max)
+        except yandex.YandexError as ex:
+            return web.json_response({"error": str(ex)}, status=400)
+        job_id, count = await ctx.lists.start(uid, "", body.get("title") or pl["title"], items=pl["items"])
+        return ok(job_id=job_id, count=count, title=pl["title"])
+    job_id, count = await ctx.lists.start(uid, text, body.get("title"))
+    return ok(job_id=job_id, count=count)
 
 
 async def list_preview(request: web.Request):
     body = await _body(request)
-    items = parse_tracklist(str(body.get("text") or ""))
+    text = str(body.get("text") or "")
+    link = yandex.find_link(text)
+    if link and len(parse_tracklist(text.replace(link, ""))) < 2:
+        try:
+            pl = await yandex.fetch(link)
+        except yandex.YandexError as ex:
+            return ok(count=0, sample=[], error=str(ex), link=True)
+        return ok(count=len(pl["items"]), sample=pl["items"][:5], title=pl["title"], link=True)
+    items = parse_tracklist(text)
     return ok(count=len(items), sample=items[:5])
 
 
@@ -548,7 +556,8 @@ async def job_get(request: web.Request):
     j = await ctx.db.one("SELECT * FROM jobs WHERE id=? AND user_id=?", (request.match_info["jid"], uid_of(request)))
     if not j:
         raise web.HTTPNotFound(text="job not found")
-    return ok({k: j[k] for k in ("id", "kind", "title", "total", "added", "status", "playlist_id", "created_at")}
+    return ok({k: j[k] for k in ("id", "kind", "title", "total", "added", "found", "status", "error", "playlist_id",
+                                 "created_at")}
               | {"missing": json.loads(j["report"] or "[]")})
 
 
@@ -667,8 +676,26 @@ async def duo_delete(request: web.Request):
 
 
 # ---------------- static ----------------
+_INDEX: dict[str, str] = {}
+
+
+def _index_html() -> str:
+    """index.html with ?v=<content hash> on every css/js link: after a deploy Telegram's webview loads the new
+    code at once instead of a cached old app.js (static files are cached for an hour)."""
+    if "html" not in _INDEX:
+        h = hashlib.sha1()
+        for f in sorted(WEBAPP_DIR.rglob("*")):
+            if f.suffix in (".js", ".css") and f.is_file():
+                h.update(f.read_bytes())
+        v = h.hexdigest()[:10]
+        html = (WEBAPP_DIR / "index.html").read_text("utf-8")
+        _INDEX["html"] = re.sub(r'(href|src)="((?:css|js)/[^"?]+\.(?:css|js))"', rf'\1="\2?v={v}"', html)
+    return _INDEX["html"]
+
+
 async def index(request: web.Request):
-    return web.FileResponse(WEBAPP_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+    return web.Response(text=_index_html(), content_type="text/html",
+                        headers={"Cache-Control": "no-cache, must-revalidate"})
 
 
 async def health(request: web.Request):

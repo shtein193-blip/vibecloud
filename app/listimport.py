@@ -22,6 +22,7 @@ from .events import EventBus
 from .security import Signer
 from .serialize import playlist_out, track_out
 from .soundcloud import SoundCloud, SoundCloudError, track_meta
+from .tasks import spawn
 
 log = logging.getLogger(__name__)
 
@@ -263,52 +264,89 @@ def score(item: dict, t: dict) -> float:
     return s
 
 
+def best_score(item: dict, t: dict) -> float:
+    """Some exports write "Title — Artist" instead of "Artist — Title": try both orders."""
+    s1 = score(item, t)
+    if item["artist"]:
+        s1 = max(s1, score({**item, "artist": item["title"], "title": item["artist"]}, t) - 0.02)
+    return s1
+
+
 THRESHOLD = 0.66
 
 
 class ListImporter:
     def __init__(self, s: Settings, db: DB, sc: SoundCloud, bus: EventBus, signer: Signer):
         self.s, self.db, self.sc, self.bus, self.signer = s, db, sc, bus, signer
-        self.sem = asyncio.Semaphore(3)  # SoundCloud search concurrency (rate limits)
+        self.sem = asyncio.Semaphore(4)  # SoundCloud search concurrency (rate limits)
         self.running: dict[int, str] = {}
+        self.timeout = 20
+
+    async def _search(self, q: str) -> list[dict]:
+        try:
+            async with self.sem:
+                return await asyncio.wait_for(self.sc.search(q, 10), self.timeout)
+        except Exception as ex:  # noqa: BLE001 — timeouts / network / 429: this query just finds nothing
+            log.info("list search %r failed: %r", q, ex)
+            return []
 
     async def find(self, item: dict) -> tuple[dict | None, float]:
+        best, best_s = None, 0.0
         queries = [f"{item['artist']} {item['title']}".strip()]
         if item["artist"]:
             queries.append(item["title"])
-            if re.search("[а-яё]", item["artist"] + item["title"], re.I):
-                queries.append(translit(f"{item['artist']} {item['title']}".lower()))
-        best, best_s = None, 0.0
-        for q in queries:
-            async with self.sem:
-                try:
-                    res = await self.sc.search(q, 12)
-                except SoundCloudError as ex:
-                    log.info("list search %r failed: %s", q, ex)
-                    continue
+        seen_any = False
+        for i, q in enumerate(queries):
+            res = await self._search(q)
+            seen_any = seen_any or bool(res)
             for t in res:
-                sc_ = score(item, t)
+                sc_ = best_score(item, t)
                 if sc_ > best_s:
                     best, best_s = t, sc_
             if best_s >= 0.85:
                 break
+        # Cyrillic names are often uploaded in Latin letters — last try, only when nothing matched
+        if best_s < THRESHOLD and re.search("[а-яё]", item["artist"] + item["title"], re.I):
+            for t in await self._search(translit(f"{item['artist']} {item['title']}".lower())):
+                sc_ = best_score(item, t)
+                if sc_ > best_s:
+                    best, best_s = t, sc_
         return (best, best_s) if best_s >= THRESHOLD else (None, best_s)
 
-    async def run(self, uid: int, text: str, title: str | None = None, on_progress=None) -> dict:
+    def prepare(self, uid: int, text: str, items: list[dict] | None = None) -> list[dict]:
         if uid in self.running:
             raise SoundCloudError("Список уже переносится — дождись окончания")
-        items = parse_tracklist(text)[: self.s.list_import_max]
+        items = (items if items is not None else parse_tracklist(text))[: self.s.list_import_max]
         if not items:
             raise SoundCloudError("Не нашёл в тексте треков. Нужен формат «Исполнитель — Название» "
                                   "по строке, CSV или текст, скопированный со страницы плейлиста.")
+        return items
+
+    async def start(self, uid: int, text: str, title: str | None = None,
+                    items: list[dict] | None = None) -> tuple[str, int]:
+        """Create the job now (the app polls it), search in the background."""
+        items = self.prepare(uid, text, items)
         title = (title or "").strip()[:60] or "Яндекс Музыка"
         job_id = await self.db.create_job(uid, f"list:{len(items)}", "list", title, None, len(items))
         self.running[uid] = job_id
+        spawn(self._guarded(uid, job_id, items, title, None), "list-import")
+        return job_id, len(items)
+
+    async def run(self, uid: int, text: str, title: str | None = None, on_progress=None,
+                  items: list[dict] | None = None) -> dict:
+        items = self.prepare(uid, text, items)
+        title = (title or "").strip()[:60] or "Яндекс Музыка"
+        job_id = await self.db.create_job(uid, f"list:{len(items)}", "list", title, None, len(items))
+        self.running[uid] = job_id
+        return await self._guarded(uid, job_id, items, title, on_progress)
+
+    async def _guarded(self, uid: int, job_id: str, items: list[dict], title: str, on_progress) -> dict:
         self.bus.publish(uid, "job", {"id": job_id, "status": "running", "kind": "list", "title": title,
                                       "artwork": None, "total": len(items), "added": 0, "found": 0})
         try:
             return await self._run(uid, job_id, items, title, on_progress)
         except Exception as ex:
+            log.exception("list import %s failed", job_id)
             await self.db.update_job(job_id, status="error", error=str(ex)[:200])
             self.bus.publish(uid, "job", {"id": job_id, "status": "error", "error": str(ex)})
             raise
@@ -338,16 +376,20 @@ class ListImporter:
         async def handle(i: int, item: dict) -> None:
             nonlocal done, last_emit
             key = keys[i]
-            if key in cached:
-                tid = cached[key]
-            else:
-                t, sc_ = await self.find(item)
+            tid = None
+            try:
+                if key in cached:
+                    tid = cached[key]
+                else:
+                    t, sc_ = await self.find(item)
+                    if t:
+                        m = track_meta(t)
+                        await self.db.upsert_tracks([m])
+                        tid = m["id"]
+                    await self.db.save_match(key, tid, sc_)
+            except Exception as ex:  # noqa: BLE001 — one bad item must not stop the whole list
+                log.warning("list item %r failed: %r", item, ex)
                 tid = None
-                if t:
-                    m = track_meta(t)
-                    await self.db.upsert_tracks([m])
-                    tid = m["id"]
-                await self.db.save_match(key, tid, sc_)
             async with lock:
                 done += 1
                 if tid:
@@ -361,7 +403,7 @@ class ListImporter:
                     self.bus.publish(uid, "job", {"id": job_id, "status": "running", "kind": "list", "title": title,
                                                   "artwork": artwork, "total": len(items), "added": done,
                                                   "found": len(found)})
-                    await self.db.update_job(job_id, added=done)
+                    await self.db.update_job(job_id, added=done, found=len(found))
                     if on_progress:
                         await on_progress(done, len(items), len(found))
 
@@ -372,7 +414,8 @@ class ListImporter:
         if artwork:
             await self.db.run("UPDATE playlists SET artwork=? WHERE id=?", (artwork, pid))
         report = [{"artist": items[i]["artist"], "title": items[i]["title"]} for i in sorted(missing)]
-        await self.db.update_job(job_id, status="done", added=len(items), playlist_id=pid, finished_at=now(),
+        await self.db.update_job(job_id, status="done", added=len(items), found=len(found), playlist_id=pid,
+                                 finished_at=now(),
                                  report=json.dumps(report, ensure_ascii=False))
         pl = await self.db.get_playlist(pid)
         result = {"job_id": job_id, "playlist_id": pid, "title": title, "total": len(items),
