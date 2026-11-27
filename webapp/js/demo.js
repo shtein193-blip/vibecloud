@@ -117,6 +117,7 @@ const duoOut = (d, full = false) => {
   return o;
 };
 const LIST_JOBS = {};
+const YA_DEMO = ['Скриптонит — Вечеринка', 'Miyagi & Andy Panda — Kosandra', 'Zivert — Life', 'The Weeknd — Blinding Lights', 'Макс Корж — Малиновый закат', 'Баста — Сансара', 'Monetochka — Каждый раз', 'Linkin Park — Numb'];
 function demoParse(text) {
   return String(text || '').split(/\r?\n/).map((l) => l.replace(/^\s*\d+[.)]\s*/, '').trim()).filter(Boolean)
     .map((l) => { const m = l.split(/\s+[—–-]\s+/); return m.length > 1 ? { artist: m[0], title: m.slice(1).join(' - ') } : { artist: '', title: l }; })
@@ -125,20 +126,21 @@ function demoParse(text) {
 function runList(text, title) {
   const items = demoParse(text).slice(0, 40), jid = 'L' + (++seq), name = title || 'Яндекс Музыка';
   const ids = [], missing = [];
-  LIST_JOBS[jid] = { id: jid, kind: 'list', title: name, total: items.length, added: 0, status: 'running', playlist_id: null, missing };
+  LIST_JOBS[jid] = { id: jid, kind: 'list', title: name, total: items.length, added: 0, found: 0, status: 'running', playlist_id: null, missing };
   (async () => {
     emit('job', { id: jid, status: 'running', kind: 'list', title: name, artwork: null, total: items.length, added: 0, found: 0 });
     for (let i = 0; i < items.length; i++) {
       await sleep(260);
       if (i % 4 === 3) missing.push(items[i]);
       else { const [id] = takeFromPool(1); const t = DB.tracks.get(id); t.title = items[i].title; t.artist = items[i].artist || t.artist; ids.push(id); DB.library.unshift(id); emit('track_added', { job: jid, playlist: null, track: tOut(t) }); }
+      Object.assign(LIST_JOBS[jid], { added: i + 1, found: ids.length });
       emit('job', { id: jid, status: 'running', kind: 'list', title: name, artwork: ids[0] ? DB.tracks.get(ids[0]).artwork : null, total: items.length, added: i + 1, found: ids.length });
     }
     const p2 = pl('p' + (++seq), 'imported', name, 'Перенос по списку', ids[0] ? DB.tracks.get(ids[0]).artwork : C('aurora'), ids.slice());
     DB.playlists.unshift(p2); Object.assign(LIST_JOBS[jid], { status: 'done', added: items.length, playlist_id: p2.id });
     emit('job', { id: jid, status: 'done', kind: 'list', title: name, artwork: p2.artwork, total: items.length, added: items.length, found: ids.length, missing: missing.length, playlist: plOut(p2) });
   })();
-  return { ok: true, count: items.length, total: items.length, sample: items.slice(0, 5) };
+  return { ok: true, job_id: jid, count: items.length, total: items.length, sample: items.slice(0, 5) };
 }
 function ewaDemo(text) {
   const t = String(text || '').toLowerCase();
@@ -257,8 +259,13 @@ async function handle(method, path, body = {}) {
       config: { bot: 'VibeCloudBot', app_link: 'https://t.me/VibeCloudBot/app', storage: true, lite: true, direct: true, ai: true, list_max: 1500 } };
   }
   if (p[0] === 'listen') { listenedSec += +body.seconds || 0; return { ok: true }; }
-  if (p[0] === 'import' && p[1] === 'list' && p[2] === 'preview') { const it = demoParse(body.text); return { count: it.length, sample: it.slice(0, 5) }; }
-  if (p[0] === 'import' && p[1] === 'list') { if (!demoParse(body.text).length) fail('Не нашёл треков'); return runList(body.text, body.title); }
+  if (p[0] === 'import' && p[1] === 'list') {
+    let text = body.text, title = body.title;
+    if (/music\.yandex\./i.test(text || '')) { text = YA_DEMO.join('\n'); title = title || 'Мой плейлист'; }
+    const it = demoParse(text);
+    if (p[2] === 'preview') return { count: it.length, sample: it.slice(0, 5), title: /music\.yandex/i.test(body.text) ? 'Мой плейлист' : undefined };
+    if (!it.length) fail('Не нашёл треков'); return { ...runList(text, title), title };
+  }
   if (p[0] === 'job') { const j = LIST_JOBS[p[1]]; if (!j) fail('Не найдено'); return j; }
   if (p[0] === 'ewa') { await sleep(700); return ewaDemo(body.text); }
   if (p[0] === 'leaders') {

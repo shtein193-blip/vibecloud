@@ -1031,6 +1031,7 @@ function profileSheet(p) {
 
 /* ------------------------------------------------------------------ actions */
 async function startImport(raw, mode) {
+  if (/music\.yandex\./i.test(raw || '')) return startListImport(raw);   // a Yandex Music link pasted into any field
   const found = linkKind(raw);
   if (!found) return toast('Вставь ссылку soundcloud.com', 'err');
   haptic('medium');
@@ -1189,24 +1190,24 @@ const ACTIONS = {
 function yandexHTML() {
   const max = (S.config && S.config.list_max) || 1500;
   return `<section class="ya" id="ya">
-    <div class="ya-head"><span class="ya-ic">${I.list}</span><div><b>Из Яндекс Музыки</b><span>Честно: по твоему списку треков — найдём те же песни на SoundCloud</span></div></div>
+    <div class="ya-head"><span class="ya-ic">${I.list}</span><div><b>Из Яндекс Музыки</b><span>Вставь ссылку на плейлист — найду те же песни на SoundCloud</span></div></div>
     <form class="field" data-form="list">
       <label class="sr" for="ya-text">Список треков</label>
-      <textarea id="ya-text" name="list" rows="4" placeholder="Вставь список: «Исполнитель — Название» по строке, или всё, что скопировал со страницы плейлиста" autocomplete="off"></textarea>
+      <textarea id="ya-text" name="list" rows="2" placeholder="music.yandex.ru/… — ссылка на плейлист или альбом" autocomplete="off"></textarea>
       <div class="field-foot">
         <button class="chip-mini" style="background:var(--glass-2);color:var(--text)" type="button" data-act="paste-ya">${I.clip}Вставить</button>
-        <label class="chip-mini chip-file" style="background:var(--glass-2);color:var(--text)">${I.file}Файл<input type="file" id="ya-file" accept=".txt,.csv,.tsv,.json,.m3u,.m3u8,text/*,application/json"></label>
-        <span class="detected" id="ya-detected">Жду список…</span>
+        <label class="chip-mini chip-file" style="background:var(--glass-2);color:var(--text)">${I.file}Файл<input type="file" id="ya-file"></label>
+        <span class="detected" id="ya-detected">Жду ссылку…</span>
         <button class="btn btn-lime" type="submit">Найти</button>
       </div>
     </form>
     <div class="ya-sample" id="ya-sample"></div>
-    <details class="howto"><summary>Как получить список своих треков ${I.chev}</summary>
+    <details class="howto"><summary>Где взять ссылку ${I.chev}</summary>
       <ol>
-        <li><b>С компьютера:</b> открой music.yandex.ru → «Коллекция» → «Мне нравится» (или любой плейлист), прокрути страницу до самого конца, выдели список мышкой и скопируй (Ctrl+C) — вставь сюда как есть.</li>
-        <li><b>Файлом:</b> если переносил плейлисты через сервисы экспорта, загрузи их .csv/.txt/.json — колонки «Artist» и «Track» распознаются сами.</li>
-        <li><b>Вручную:</b> строки вида «Исполнитель — Название».</li>
-        <li>До ${max} треков за раз. Мы не заходим в твой аккаунт Яндекса и ничего оттуда не скачиваем — только ищем публичные треки на SoundCloud.</li>
+        <li>В Яндекс Музыке открой плейлист → <b>⋯</b> → <b>«Поделиться»</b> → <b>«Скопировать ссылку»</b>.</li>
+        <li>Вставь её сюда кнопкой «Вставить» и нажми <b>«Найти»</b>. Можно и просто отправить ссылку боту в чат.</li>
+        <li>Плейлист должен быть открытым. Если пишет, что он закрытый, — открой доступ в настройках плейлиста или скопируй треки в новый плейлист.</li>
+        <li>Ещё можно вставить список «Исполнитель — Название» или выбрать файл .txt/.csv. До ${max} треков; VibeCloud читает только названия треков и ищет их на SoundCloud.</li>
       </ol>
     </details>
   </section>`;
@@ -1215,12 +1216,14 @@ let yaTimer;
 function yaDetect(text) {
   const det = $('#ya-detected'), smp = $('#ya-sample'); if (!det) return;
   clearTimeout(yaTimer);
-  if (!text.trim()) { det.textContent = 'Жду список…'; det.className = 'detected'; smp.innerHTML = ''; return; }
-  det.textContent = 'Читаю список…'; det.className = 'detected';
+  if (!text.trim()) { det.textContent = 'Жду ссылку…'; det.className = 'detected'; smp.innerHTML = ''; return; }
+  const isLink = /music\.yandex\./i.test(text);
+  det.textContent = isLink ? 'Открываю плейлист…' : 'Читаю список…'; det.className = 'detected';
   yaTimer = setTimeout(async () => {
     try {
       const r = await API.post('/api/import/list/preview', { text });
-      det.textContent = r.count ? `${tracksWord(r.count)} — найду на SoundCloud` : 'Не вижу треков — нужен «Исполнитель — Название»';
+      det.textContent = r.error ? r.error : r.count ? `${r.title ? '«' + r.title + '» · ' : ''}${tracksWord(r.count)} — найду на SoundCloud`
+        : (isLink ? 'Не вижу треков в плейлисте' : 'Не вижу треков — вставь ссылку или «Исполнитель — Название»');
       det.className = 'detected' + (r.count ? ' ok' : '');
       smp.innerHTML = r.count ? 'Например: ' + r.sample.slice(0, 3).map((x) => `<i>${esc(x.artist ? x.artist + ' — ' : '')}${esc(x.title)}</i>`).join(', ') : '';
     } catch (_) { /* offline */ }
@@ -1233,9 +1236,45 @@ async function startListImport(text, title) {
     const r = await API.post('/api/import/list', { text, title });
     toast(`Ищу ${tracksWord(r.count)} на SoundCloud ✦`);
     const ta = $('#ya-text'); if (ta) { ta.value = ''; yaDetect(''); }
+    if (r.job_id) {
+      S.transit.set(r.job_id, { ...(S.transit.get(r.job_id) || {}), id: r.job_id, kind: 'list', status: 'running', title: r.title || title || 'Яндекс Музыка', total: r.count, added: 0, found: 0, ids: [] });
+      refreshTransit(true);
+      pollListJob(r.job_id);
+    }
   } catch (e) { toast(e.message, 'err'); }
 }
-async function listReport(jid) {
+/* progress without relying on live events (a tunnel/proxy may buffer them): ask the server every few seconds */
+const polling = new Set();
+async function pollListJob(jid) {
+  if (polling.has(jid)) return; polling.add(jid);
+  try {
+    for (let i = 0; i < 1500; i++) {
+      await sleep(2500);
+      let j; try { j = await API.get(`/api/job/${jid}`); } catch (_) { continue; }
+      const cur = S.transit.get(jid);
+      if (cur && cur.status === 'done') return;          // live events already finished it
+      S.transit.set(jid, { ...(cur || { ids: [] }), id: jid, kind: 'list', title: j.title, total: j.total, added: j.added, found: j.found, status: j.status });
+      refreshTransit();
+      if (j.status === 'error') { S.transit.delete(jid); refreshTransit(true); return toast(j.error || 'Перенос не удался', 'err'); }
+      if (j.status === 'done') {
+        if (j.playlist_id) {
+          try {
+            const pl = await API.get(`/api/playlist/${j.playlist_id}`);
+            pl.tracks.forEach((t) => upsertTrack({ ...t }, { prepend: true }));
+            const { tracks, ...meta } = pl; S.playlists = [meta, ...S.playlists.filter((p) => p.id !== meta.id)];
+            scheduleTransitAndLists();
+          } catch (_) { /* playlist will show after reload */ }
+        }
+        haptic('success'); listReport(jid);
+        setTimeout(() => { S.transit.delete(jid); refreshTransit(true); }, 6000);
+        return;
+      }
+    }
+  } finally { polling.delete(jid); }
+}
+const reported = new Set();
+async function listReport(jid, force = false) {
+  if (!force && reported.has(jid)) return; reported.add(jid);
   let j;
   try { j = await API.get(`/api/job/${jid}`); } catch (e) { return toast(e.message, 'err'); }
   const found = Math.max(0, (j.total || 0) - j.missing.length);
@@ -1486,7 +1525,7 @@ Object.assign(ACTIONS, {
     catch (e) { toast(e.message, 'err'); }
   },
   'paste-ya': async () => { const t = await readClipboard(); if (!t) return toast('Буфер пуст', 'err'); const ta = $('#ya-text'); ta.value = t; yaDetect(t); },
-  'list-report': (el) => { const j = S.transit.get(el.dataset.job); if (j && j.status === 'running') return toast(`Ищу… ${j.added || 0} из ${j.total}`); listReport(el.dataset.job); },
+  'list-report': (el) => { const j = S.transit.get(el.dataset.job); if (j && j.status === 'running') return toast(`Ищу… ${j.added || 0} из ${j.total}, найдено ${j.found || 0}`); listReport(el.dataset.job, true); },
   'miss-search': (el) => { closeSheet(); S.q = el.dataset.q; S.filter = 'all'; go('library', { force: true }); const inp = $('#lib-q'); if (inp) { inp.value = S.q; inp.dispatchEvent(new Event('input', { bubbles: true })); } },
   period: (el) => { haptic('select'); loadLeaders(el.dataset.p); },
   'toggle-hidden': async (el) => {
